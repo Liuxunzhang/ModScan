@@ -82,6 +82,95 @@ modscan_cli.c   — 用户态 CLI 工具
 Makefile        — 构建脚本
 ```
 
+## 当模块加载被 rootkit 禁止时
+
+rootkit 植入后可能采取以下措施阻止加载检测工具：
+
+### 攻击手段与检测方法
+
+| 攻击手段 | 实现方式 | 检测工具 | 还原路径 |
+|---|---|---|---|
+| `modules_disabled=1` | 单向开关，写内核变量 | `modscan_scan.sh` `modscan_kcore` | **kexec** 或重启 |
+| Hook `finit_module` | 函数首字节改写为 `JMP` | `modscan_kcore` | 预加载 modscan 或 kexec |
+| 系统调用表劫持 | `sys_call_table[313]` 改写 | `modscan_kcore` | 同上 |
+| LSM hook 插入 | 向 `security_hook_heads` 插入拦截函数 | `modscan_kcore`（部分） | 同上 |
+| `sig_enforce=1` | 强制签名验证 | `modscan_scan.sh` | 签署模块或 kexec |
+
+### 检测工具（无需加载模块）
+
+```bash
+# 方法1: 纯 bash，最简单
+sudo bash modscan_scan.sh
+
+# 方法2: 更深层，通过 /proc/kcore 读取内核内存
+sudo ./modscan_kcore
+
+# 一键运行两种检测
+make check
+```
+
+### 还原路径
+
+**方案 A（最优）：提前加载 modscan.ko**
+
+在 rootkit 有机会禁用模块加载之前加载 modscan：
+
+```bash
+# 开机自动加载（加入 /etc/modules 或 systemd unit）
+echo "modscan" >> /etc/modules
+
+# 之后即使 modules_disabled=1，/proc/modscan 仍然可用
+echo 'restore <hidden_mod>' > /proc/modscan
+```
+
+**方案 B：kexec 替换内核**
+
+`kexec` 直接将新内核加载到内存并执行，**不依赖模块加载机制**，rootkit 随旧内核消失：
+
+```bash
+# 确认 kexec 未被禁用
+cat /proc/sys/kernel/kexec_load_disabled   # 必须为 0
+
+# 加载干净的内核镜像
+kexec -l /boot/vmlinuz-$(uname -r) \
+      --initrd=/boot/initramfs-$(uname -r).img \
+      --reuse-cmdline
+
+# 执行切换（rootkit 消失）
+kexec -e
+```
+
+**方案 C：内核调试器 kdb**
+
+若内核编译时启用了 `CONFIG_KDB=y`（RHEL/CentOS 系内核通常有）：
+
+```bash
+# 触发进入 kdb
+echo g > /proc/sysrq-trigger
+
+# 在 kdb 中：
+kdb> lsmod                          # 查看所有模块（包括隐藏的）
+kdb> md <modules_list_addr>         # 读链表内存
+kdb> mm <list.next_addr> <value>    # 直接写指针，重新链接模块
+# mm 命令绕过所有软件 hook，直接操作物理内存映射
+```
+
+**方案 D：可信介质重启**
+
+最保守但最可靠的方案：从 Live USB/CD 启动，挂载受感染的文件系统进行离线分析和清理。
+
+### 检测能力矩阵
+
+```
+                      modscan.ko  modscan_scan.sh  modscan_kcore
+DKOM list_del 隐藏        ✓             ✓               ✓
+modules_disabled=1        N/A           ✓               ✓
+finit_module 内联 patch   N/A           ✓(需python3)    ✓
+系统调用表劫持             N/A           ✓(需python3)    ✓
+LSM hook 插入             N/A           ✗               部分
+/proc/modules 伪造        N/A           ✗               ✓(kcore对比)
+```
+
 ## 注意事项
 
 - 需要 root 权限（`CAP_SYS_MODULE`）
