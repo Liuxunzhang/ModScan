@@ -144,33 +144,35 @@ check_kallsyms_orphans() {
         return
     fi
 
-    # 构建 /proc/modules 中的模块名集合（第1列）
-    declare -A known_mods
-    while read -r name _rest; do
-        known_mods["$name"]=1
-    done < /proc/modules
+    # 使用 awk 一次性处理两个文件，避免 bash while 循环逐行读取 10万+ 行的性能问题
+    # NR==FNR: 第一个文件 /proc/modules，记录已知模块名
+    # NR!=FNR: 第二个文件 /proc/kallsyms，找 [modname] 列不在已知集合中的条目
+    local result
+    result=$(awk '
+        NR == FNR {
+            known[$1] = 1
+            next
+        }
+        NF >= 4 && $4 ~ /^\[.+\]$/ {
+            modname = substr($4, 2, length($4) - 2)
+            if (!(modname in known)) {
+                count[modname]++
+                seen[modname] = 1
+            }
+        }
+        END {
+            for (m in seen)
+                print count[m], m
+        }
+    ' /proc/modules /proc/kallsyms)
 
-    # 扫描 kallsyms 中带 [modname] 的行
-    declare -A orphan_mods
-    declare -A orphan_count
-    while read -r _addr _type _sym rest; do
-        [[ -z "$rest" ]] && continue
-        # rest 格式: [modname]
-        [[ "$rest" =~ ^\[([^\]]+)\]$ ]] || continue
-        local modname="${BASH_REMATCH[1]}"
-        if [[ -z "${known_mods[$modname]+_}" ]]; then
-            orphan_mods["$modname"]=1
-            orphan_count["$modname"]=$(( ${orphan_count[$modname]:-0} + 1 ))
-        fi
-    done < /proc/kallsyms
-
-    if [[ ${#orphan_mods[@]} -eq 0 ]]; then
+    if [[ -z "$result" ]]; then
         ok "  kallsyms 中未发现孤儿模块符号"
     else
-        for m in "${!orphan_mods[@]}"; do
-            alert "  ORPHAN MODULE: '$m'（${orphan_count[$m]} 个符号残留在 kallsyms 中，但不在 /proc/modules）"
+        while read -r cnt modname; do
+            alert "  ORPHAN MODULE: '$modname'（$cnt 个符号残留在 kallsyms 中，但不在 /proc/modules）"
             flag
-        done
+        done <<< "$result"
     fi
 }
 
