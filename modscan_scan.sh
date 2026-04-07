@@ -101,6 +101,9 @@ check_modules_consistency() {
         proc_mods["$name"]=1
     done < /proc/modules
 
+    # 构建 /sys/module/ 中真实 LKM 集合（存在 initstate）
+    declare -A sys_mods
+
     # 遍历 /sys/module/ 中的真实 LKM 目录
     # 判断标准：存在 initstate 文件（内核内建子系统没有此文件）
     local hidden=0
@@ -111,6 +114,7 @@ check_modules_consistency() {
 
         # 过滤：只检查有 initstate 的（真正的 LKM）
         [[ -f "${d}initstate" ]] || continue
+        sys_mods["$mname"]=1
 
         if [[ -z "${proc_mods[$mname]+_}" ]]; then
             alert "  HIDDEN MODULE: '$mname'"
@@ -121,10 +125,27 @@ check_modules_consistency() {
         fi
     done
 
-    if [[ $hidden -eq 0 ]]; then
+    # 反向检查：在 /proc/modules 但不在 /sys/module/（kset/sysfs 可疑）
+    local missing_sysfs=0
+    local pname
+    for pname in "${!proc_mods[@]}"; do
+        if [[ -z "${sys_mods[$pname]+_}" ]]; then
+            alert "  KSET/SYSFS_TAMPER_SUSPECT: '$pname'"
+            alert "    → 存在于 /proc/modules 但不在 /sys/module/（可能 kset/sysfs 视图被篡改）"
+            flag
+            missing_sysfs=$(( missing_sysfs + 1 ))
+        fi
+    done
+
+    if [[ $hidden -eq 0 && $missing_sysfs -eq 0 ]]; then
         ok "  /sys/module/ 和 /proc/modules 一致（未发现 DKOM 隐藏模块）"
     else
-        alert "  共发现 $hidden 个 DKOM 隐藏模块"
+        if [[ $hidden -gt 0 ]]; then
+            alert "  共发现 $hidden 个 DKOM 隐藏模块"
+        fi
+        if [[ $missing_sysfs -gt 0 ]]; then
+            alert "  共发现 $missing_sysfs 个 /proc/modules 与 /sys/module/ 反向不一致项"
+        fi
     fi
 }
 
@@ -170,7 +191,13 @@ check_kallsyms_orphans() {
         ok "  kallsyms 中未发现孤儿模块符号"
     else
         while read -r cnt modname; do
-            alert "  ORPHAN MODULE: '$modname'（$cnt 个符号残留在 kallsyms 中，但不在 /proc/modules）"
+            if [[ -d "/sys/module/$modname" ]]; then
+                alert "  DKOM_ORPHAN: '$modname'（$cnt 个符号残留在 kallsyms 中，不在 /proc/modules，但在 /sys/module/）"
+                alert "    → 高置信度：模块被从 modules 链表摘除"
+            else
+                alert "  KALLSYMS_ORPHAN: '$modname'（$cnt 个符号仅在 kallsyms 中，不在 /proc/modules 也不在 /sys/module/）"
+                alert "    → 可能为更深层隐藏或 /sys/module 视图篡改"
+            fi
             flag
         done <<< "$result"
     fi

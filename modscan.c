@@ -199,6 +199,19 @@ static bool name_in_modules_list(const char *name)
 	return false;
 }
 
+static bool name_in_snapshot(const char *name,
+			     const struct modscan_snap *snap,
+			     int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (strcmp(snap[i].name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
 /* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
@@ -206,7 +219,9 @@ static bool name_in_modules_list(const char *name)
 static int modscan_show(struct seq_file *m, void *v)
 {
 	struct modscan_snap *snap;
+	struct module *mod;
 	int i, n = 0, n_hidden = 0;
+	int n_kset_tamper = 0;
 
 	snap = snapshot_kset(&n);
 	if (IS_ERR(snap))
@@ -229,13 +244,29 @@ static int modscan_show(struct seq_file *m, void *v)
 		}
 	}
 
+	/* Reverse direction: module list has entry missing from module_kset */
+	list_for_each_entry(mod, modules_list_head, list) {
+		if (strcmp(mod->name, THIS_MODULE->name) == 0)
+			continue;
+		if (!name_in_snapshot(mod->name, snap, n)) {
+			seq_printf(m, "KSET_TAMPER_SUSPECT  %s\n", mod->name);
+			n_kset_tamper++;
+		}
+	}
+
 	mutex_unlock(&module_mutex);
 	kfree(snap);
 
-	if (n_hidden == 0)
+	if (n_hidden == 0 && n_kset_tamper == 0) {
 		seq_puts(m, "(no hidden modules detected)\n");
-	else
-		seq_printf(m, "\n%d hidden module(s) found.\n", n_hidden);
+	} else {
+		if (n_hidden > 0)
+			seq_printf(m, "\n%d hidden module(s) found.\n", n_hidden);
+		if (n_kset_tamper > 0)
+			seq_printf(m,
+				   "%d module(s) missing from module_kset (possible kset/sysfs tampering).\n",
+				   n_kset_tamper);
+	}
 
 	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
 	return 0;

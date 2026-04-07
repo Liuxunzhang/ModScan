@@ -10,6 +10,7 @@
  *   2. DKOM list_del 隐藏模块（walk modules 链表，与 /sys/module/ 对比）
  *   3. finit_module / init_module / load_module 内联 patch
  *   4. 系统调用表指针劫持 (sys_call_table[313])
+ *   5. struct module 内存特征扫描（不依赖链表）
  *
  * struct module 布局（x86-64，无 __randomize_layout，跨内核版本稳定）：
  *   offset  0: enum module_state state   (4 bytes)
@@ -79,6 +80,8 @@ static int g_findings = 0;
 #define MODULE_NAME_OFF      24  /* char name[MODULE_NAME_LEN] */
 #define MODULE_NAME_LEN      56
 
+#define MAX_MODULES 1024
+
 /* ─── /proc/kallsyms 符号表 ─────────────────────────────────────────────── */
 #define KSYM_HASH_BITS  14
 #define KSYM_HASH_SIZE  (1 << KSYM_HASH_BITS)
@@ -94,6 +97,39 @@ typedef struct ksym_entry {
 static ksym_entry_t *ksym_hash[KSYM_HASH_SIZE];
 static ksym_entry_t  ksym_pool[KSYM_MAX];
 static int           ksym_count;
+
+typedef struct {
+    char name[MODULE_NAME_LEN];
+    int  sym_count;
+} ksym_modref_t;
+
+static ksym_modref_t ksym_modrefs[MAX_MODULES];
+static int           ksym_modrefs_n;
+
+static void set_mod_name(char dst[MODULE_NAME_LEN], const char *src)
+{
+    size_t n = strnlen(src, MODULE_NAME_LEN - 1);
+
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void add_ksym_modref(const char *name)
+{
+    for (int i = 0; i < ksym_modrefs_n; i++) {
+        if (strcmp(ksym_modrefs[i].name, name) == 0) {
+            ksym_modrefs[i].sym_count++;
+            return;
+        }
+    }
+
+    if (ksym_modrefs_n >= MAX_MODULES)
+        return;
+
+    set_mod_name(ksym_modrefs[ksym_modrefs_n].name, name);
+    ksym_modrefs[ksym_modrefs_n].sym_count = 1;
+    ksym_modrefs_n++;
+}
 
 static uint32_t fnv1a(const char *s)
 {
@@ -114,8 +150,11 @@ static bool parse_kallsyms(void)
     char line[256];
     while (fgets(line, sizeof(line), f) && ksym_count < KSYM_MAX) {
         uint64_t addr;
-        char     type[4], name[128];
-        if (sscanf(line, "%lx %3s %127s", &addr, type, name) != 3)
+        char     type[4], name[128], modtag[MODULE_NAME_LEN + 4] = {0};
+        int      fields;
+
+        fields = sscanf(line, "%lx %3s %127s %59s", &addr, type, name, modtag);
+        if (fields < 3)
             continue;
         if (addr == 0)
             continue;
@@ -127,6 +166,15 @@ static bool parse_kallsyms(void)
         uint32_t h = fnv1a(name) & KSYM_HASH_MASK;
         e->next       = ksym_hash[h];
         ksym_hash[h]  = e;
+
+        if (fields >= 4 && modtag[0] == '[') {
+            char *end = strchr(modtag, ']');
+
+            if (end && end > modtag + 1) {
+                *end = '\0';
+                add_ksym_modref(modtag + 1);
+            }
+        }
     }
     fclose(f);
     return true;
@@ -218,14 +266,17 @@ static void check_modules_disabled(void)
         FILE *f = fopen("/proc/sys/kernel/modules_disabled", "r");
         if (f) {
             int val = 0;
-            fscanf(f, "%d", &val);
-            fclose(f);
-            if (val == 1) {
-                alert("  modules_disabled=1 — 模块加载已被永久禁止！");
-                FINDING();
+            if (fscanf(f, "%d", &val) == 1) {
+                if (val == 1) {
+                    alert("  modules_disabled=1 — 模块加载已被永久禁止！");
+                    FINDING();
+                } else {
+                    ok("  modules_disabled=0（正常）");
+                }
             } else {
-                ok("  modules_disabled=0（正常）");
+                warn("  无法解析 /proc/sys/kernel/modules_disabled");
             }
+            fclose(f);
         }
     }
 
@@ -249,20 +300,21 @@ static void check_modules_disabled(void)
     FILE *f = fopen("/proc/sys/kernel/kexec_load_disabled", "r");
     if (f) {
         int val = 0;
-        fscanf(f, "%d", &val);
-        fclose(f);
-        if (val == 1) {
-            alert("  kexec_load_disabled=1 — kexec 恢复路径被封锁！");
-            FINDING();
+        if (fscanf(f, "%d", &val) == 1) {
+            if (val == 1) {
+                alert("  kexec_load_disabled=1 — kexec 恢复路径被封锁！");
+                FINDING();
+            } else {
+                ok("  kexec_load_disabled=0（kexec 可用）");
+            }
         } else {
-            ok("  kexec_load_disabled=0（kexec 可用）");
+            warn("  无法解析 /proc/sys/kernel/kexec_load_disabled");
         }
+        fclose(f);
     }
 }
 
 /* ─── CHECK 2: 走 modules 链表，与 /sys/module/ 对比 ────────────────────── */
-
-#define MAX_MODULES 1024
 
 typedef struct {
     char     name[MODULE_NAME_LEN];
@@ -277,6 +329,16 @@ static int       sysfs_modlist_n;
 
 static modinfo_t procmod_list[MAX_MODULES];
 static int       procmod_list_n;
+static bool      module_views_ready;
+
+typedef struct {
+    char     name[MODULE_NAME_LEN];
+    uint64_t mod_addr;
+    int      score;
+} carved_mod_t;
+
+static carved_mod_t carved_modlist[MAX_MODULES];
+static int          carved_modlist_n;
 
 /*
  * walk_module_list() — 通过 kcore 遍历 modules 链表
@@ -316,7 +378,7 @@ static int walk_module_list(uint64_t modules_head_addr)
         if (!valid)
             break;
 
-        strncpy(kcore_modlist[n].name, name, MODULE_NAME_LEN - 1);
+        set_mod_name(kcore_modlist[n].name, name);
         kcore_modlist[n].mod_addr = mod_addr;
         n++;
 
@@ -347,8 +409,7 @@ static int scan_sysfs_modules(void)
         snprintf(path, sizeof(path), "/sys/module/%s/initstate", de->d_name);
         if (access(path, F_OK) != 0)
             continue;
-        strncpy(sysfs_modlist[n].name, de->d_name, MODULE_NAME_LEN - 1);
-        sysfs_modlist[n].name[MODULE_NAME_LEN - 1] = '\0';
+        set_mod_name(sysfs_modlist[n].name, de->d_name);
         n++;
     }
     closedir(d);
@@ -368,7 +429,7 @@ static int read_proc_modules(void)
     while (fgets(line, sizeof(line), f) && n < MAX_MODULES) {
         char name[MODULE_NAME_LEN] = {0};
         if (sscanf(line, "%55s", name) == 1) {
-            strncpy(procmod_list[n].name, name, MODULE_NAME_LEN - 1);
+            set_mod_name(procmod_list[n].name, name);
             n++;
         }
     }
@@ -382,6 +443,204 @@ static bool name_in_list(const char *name, modinfo_t *list, int n)
         if (strcmp(list[i].name, name) == 0)
             return true;
     return false;
+}
+
+static int ksym_modref_count(const char *name)
+{
+    for (int i = 0; i < ksym_modrefs_n; i++) {
+        if (strcmp(ksym_modrefs[i].name, name) == 0)
+            return ksym_modrefs[i].sym_count;
+    }
+    return 0;
+}
+
+static bool is_kernel_ptr(uint64_t p)
+{
+    return p >= 0xffff000000000000ULL && (p & 0x7) == 0;
+}
+
+static bool valid_mod_name_char(char c)
+{
+    if (c >= 'a' && c <= 'z')
+        return true;
+    if (c >= 'A' && c <= 'Z')
+        return true;
+    if (c >= '0' && c <= '9')
+        return true;
+    return c == '_' || c == '-' || c == '.';
+}
+
+static int score_module_blob(const uint8_t *p, char out_name[MODULE_NAME_LEN])
+{
+    int32_t state = 0;
+    uint64_t next = 0, prev = 0;
+    const char *name = (const char *)(p + MODULE_NAME_OFF);
+    size_t len = 0;
+    int score = 0;
+
+    memcpy(&state, p + MODULE_STATE_OFF, sizeof(state));
+    memcpy(&next, p + MODULE_LIST_NEXT_OFF, sizeof(next));
+    memcpy(&prev, p + MODULE_LIST_PREV_OFF, sizeof(prev));
+
+    while (len < MODULE_NAME_LEN && name[len] != '\0') {
+        if (!valid_mod_name_char(name[len]))
+            return 0;
+        len++;
+    }
+    if (len < 2 || len >= MODULE_NAME_LEN)
+        return 0;
+
+    set_mod_name(out_name, name);
+    score++;
+
+    if (state >= 0 && state <= 8)
+        score++;
+    if (is_kernel_ptr(next))
+        score++;
+    if (is_kernel_ptr(prev))
+        score++;
+    if (next != 0 && prev != 0 && next != prev)
+        score++;
+    if (ksym_modref_count(out_name) > 0)
+        score++;
+
+    return score;
+}
+
+static void add_carved_candidate(const char *name, uint64_t mod_addr, int score)
+{
+    for (int i = 0; i < carved_modlist_n; i++) {
+        if (strcmp(carved_modlist[i].name, name) == 0) {
+            if (score > carved_modlist[i].score) {
+                carved_modlist[i].mod_addr = mod_addr;
+                carved_modlist[i].score = score;
+            }
+            return;
+        }
+        if (carved_modlist[i].mod_addr == mod_addr)
+            return;
+    }
+
+    if (carved_modlist_n >= MAX_MODULES)
+        return;
+
+    set_mod_name(carved_modlist[carved_modlist_n].name, name);
+    carved_modlist[carved_modlist_n].mod_addr = mod_addr;
+    carved_modlist[carved_modlist_n].score = score;
+    carved_modlist_n++;
+}
+
+static int carve_module_candidates(void)
+{
+    enum { CARVE_CHUNK = 1 << 20, CARVE_STEP = 8 };
+    const size_t need = MODULE_NAME_OFF + MODULE_NAME_LEN;
+    uint8_t *buf;
+
+    carved_modlist_n = 0;
+    buf = malloc(CARVE_CHUNK);
+    if (!buf)
+        return -1;
+
+    for (int s = 0; s < nksegs; s++) {
+        uint64_t seg_start = ksegs[s].vaddr;
+        uint64_t seg_end = ksegs[s].vaddr + ksegs[s].filesz;
+        uint64_t va = seg_start;
+
+        if (seg_end < 0xffff000000000000ULL)
+            continue;
+        if (seg_start < 0xffff000000000000ULL)
+            seg_start = 0xffff000000000000ULL;
+        va = seg_start;
+
+        if (ksegs[s].filesz < need)
+            continue;
+
+        while (va + need <= seg_end) {
+            size_t to_read = CARVE_CHUNK;
+            if (va + to_read > seg_end)
+                to_read = (size_t)(seg_end - va);
+
+            off_t foff = (off_t)(ksegs[s].file_offset + (va - seg_start));
+            ssize_t got = pread(kcore_fd, buf, to_read, foff);
+            if (got <= 0)
+                break;
+
+            size_t limit = (size_t)got;
+            if (limit < need)
+                break;
+
+            for (size_t off = 0; off + need <= limit; off += CARVE_STEP) {
+                char name[MODULE_NAME_LEN];
+                int score = score_module_blob(buf + off, name);
+
+                if (score < 5)
+                    continue;
+                add_carved_candidate(name, va + off, score);
+            }
+
+            va += limit;
+        }
+    }
+
+    free(buf);
+    return carved_modlist_n;
+}
+
+static void check_module_carving(void)
+{
+    info("CHECK 3: struct module 内存特征扫描（不依赖链表）");
+
+    if (kcore_fd < 0 || nksegs <= 0) {
+        warn("  /proc/kcore 不可用，跳过内存特征扫描");
+        return;
+    }
+
+    int n = carve_module_candidates();
+    if (n < 0) {
+        warn("  内存特征扫描初始化失败");
+        return;
+    }
+
+    if (!module_views_ready) {
+        warn("  依赖视图未就绪（/sys/module 或 /proc/modules 读取失败），仅输出候选数量");
+        printf("    carving 命中 %d 个候选模块对象\n", n);
+        return;
+    }
+
+    printf("    carving 命中 %d 个候选模块对象\n", n);
+
+    int high_risk = 0;
+    int confirmed = 0;
+    for (int i = 0; i < carved_modlist_n; i++) {
+        bool in_kcore = name_in_list(carved_modlist[i].name,
+                                     kcore_modlist, kcore_modlist_n);
+        bool in_proc  = name_in_list(carved_modlist[i].name,
+                                     procmod_list, procmod_list_n);
+        bool in_sysfs = name_in_list(carved_modlist[i].name,
+                                     sysfs_modlist, sysfs_modlist_n);
+        int  ksym_n   = ksym_modref_count(carved_modlist[i].name);
+
+        if (!in_kcore && !in_proc && !in_sysfs) {
+            alert("  CARVED_HIDDEN_HIGH: '%s' 仅在内存特征扫描中出现（score=%d, addr=%#lx）",
+                  carved_modlist[i].name, carved_modlist[i].score,
+                  (unsigned long)carved_modlist[i].mod_addr);
+            FINDING();
+            high_risk++;
+        } else if (!in_proc && in_sysfs) {
+            alert("  DKOM_HIDDEN_CONFIRMED: '%s' carving+sysfs 命中，但 /proc/modules 缺失",
+                  carved_modlist[i].name);
+            FINDING();
+            confirmed++;
+        } else if (in_proc && !in_sysfs && ksym_n > 0) {
+            alert("  KSET_SYSFS_TAMPER_SUSPECT: '%s' carving+/proc/kallsyms 命中，但 /sys/module 缺失",
+                  carved_modlist[i].name);
+            FINDING();
+            confirmed++;
+        }
+    }
+
+    if (high_risk == 0 && confirmed == 0)
+        ok("  carving 与现有视图未发现额外高风险隐藏模块");
 }
 
 static void check_hidden_modules(void)
@@ -409,11 +668,15 @@ static void check_hidden_modules(void)
     sysfs_modlist_n = scan_sysfs_modules();
     procmod_list_n  = read_proc_modules();
 
-    if (sysfs_modlist_n < 0 || procmod_list_n < 0)
+    if (sysfs_modlist_n < 0 || procmod_list_n < 0) {
+        module_views_ready = false;
         return;
+    }
 
-    printf("    /sys/module/ 共 %d 个 LKM，/proc/modules 共 %d 个模块\n",
-           sysfs_modlist_n, procmod_list_n);
+    module_views_ready = true;
+
+    printf("    /sys/module/ 共 %d 个 LKM，/proc/modules 共 %d 个模块，kallsyms 模块标签 %d 个\n",
+           sysfs_modlist_n, procmod_list_n, ksym_modrefs_n);
 
     /* ── 检测1: 在 /sys/module/ 但不在 /proc/modules → DKOM 隐藏 ── */
     int hidden = 0;
@@ -452,6 +715,50 @@ static void check_hidden_modules(void)
                 FINDING();
             }
         }
+
+        /* ── 检测4: kcore/proc 有但 sysfs 无 → 可能 kset/sysfs 被篡改 ── */
+        for (int i = 0; i < kcore_modlist_n; i++) {
+            bool in_sysfs = name_in_list(kcore_modlist[i].name,
+                                         sysfs_modlist, sysfs_modlist_n);
+            bool in_proc  = name_in_list(kcore_modlist[i].name,
+                                         procmod_list, procmod_list_n);
+            if (in_proc && !in_sysfs) {
+                alert("  KSET/SYSFS_TAMPER_SUSPECT: '%s' 在 kcore 链表和 /proc/modules 中，但不在 /sys/module/",
+                      kcore_modlist[i].name);
+                FINDING();
+            }
+        }
+    }
+
+    /* ── 检测5: kallsyms 模块标签与 proc/sysfs 交叉验证 ── */
+    for (int i = 0; i < ksym_modrefs_n; i++) {
+        bool in_proc  = name_in_list(ksym_modrefs[i].name,
+                                     procmod_list, procmod_list_n);
+        bool in_sysfs = name_in_list(ksym_modrefs[i].name,
+                                     sysfs_modlist, sysfs_modlist_n);
+
+        if (!in_proc && !in_sysfs) {
+            alert("  KALLSYMS_ORPHAN: '%s' 仅存在于 kallsyms 标签（%d 个符号），不在 /proc/modules 和 /sys/module/",
+                  ksym_modrefs[i].name, ksym_modrefs[i].sym_count);
+            FINDING();
+        } else if (in_proc && !in_sysfs) {
+            alert("  SYSFS_TAMPER_SUSPECT: '%s' 在 /proc/modules 与 kallsyms 中存在，但 /sys/module/ 缺失",
+                  ksym_modrefs[i].name);
+            FINDING();
+        }
+    }
+
+    /* ── 检测6: sysfs 独有且 proc/kallsyms 都无 → 可能 sysfs 伪造 ── */
+    for (int i = 0; i < sysfs_modlist_n; i++) {
+        bool in_proc = name_in_list(sysfs_modlist[i].name,
+                                    procmod_list, procmod_list_n);
+        int  ksym_n  = ksym_modref_count(sysfs_modlist[i].name);
+
+        if (!in_proc && ksym_n == 0) {
+            warn("  SYSFS_INCONSISTENCY: '%s' 仅出现在 /sys/module/，不在 /proc/modules 且无 kallsyms 模块符号",
+                 sysfs_modlist[i].name);
+            FINDING();
+        }
     }
 
     if (hidden == 0 && g_findings == 0)
@@ -479,7 +786,7 @@ static bool is_inline_patched(const uint8_t *b, int len, const char **reason)
 
 static void check_function_integrity(void)
 {
-    info("CHECK 3: 内核函数内联 patch 检测");
+    info("CHECK 4: 内核函数内联 patch 检测");
 
     static const struct {
         const char *symname;
@@ -526,7 +833,7 @@ static void check_function_integrity(void)
 
 static void check_syscall_table(void)
 {
-    info("CHECK 4: 系统调用表指针完整性");
+    info("CHECK 5: 系统调用表指针完整性");
 
     uint64_t sct = sym_addr("sys_call_table");
     if (!sct) {
@@ -625,6 +932,7 @@ int main(void)
     /* 执行所有检测 */
     check_modules_disabled();  printf("\n");
     check_hidden_modules();    printf("\n");
+    check_module_carving();    printf("\n");
 
     if (kcore_fd >= 0) {
         check_function_integrity(); printf("\n");

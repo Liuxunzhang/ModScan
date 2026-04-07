@@ -21,7 +21,10 @@ Linux 内核维护两个独立的数据结构追踪已加载模块：
 | `modules` 链表（`struct module.list`） | `lsmod`、`rmmod` 使用 | 是，rootkit 会从此处摘除 |
 | `module_kset` kobject 树 | sysfs (`/sys/module/`) 使用 | 通常不影响 |
 
-ModScan 对比这两个数据结构：**出现在 kset 中但不在 modules 链表中的模块就是被隐藏的模块**。
+ModScan 对比这两个数据结构：
+
+- **出现在 kset 中但不在 modules 链表中**：典型 `list_del` 隐藏模块
+- **出现在 modules 链表中但不在 kset/sysfs 中**：疑似 `module_kset`/sysfs 视图被篡改
 
 还原时，使用 `list_add()` 将模块重新插入 `modules` 链表头部，之后 `lsmod` 和 `rmmod` 即可正常工作。
 
@@ -95,6 +98,8 @@ rootkit 植入后可能采取以下措施阻止加载检测工具：
 | 系统调用表劫持 | `sys_call_table[313]` 改写 | `modscan_kcore` | 同上 |
 | LSM hook 插入 | 向 `security_hook_heads` 插入拦截函数 | `modscan_kcore`（部分） | 同上 |
 | `sig_enforce=1` | 强制签名验证 | `modscan_scan.sh` | 签署模块或 kexec |
+| `module_kset`/sysfs 篡改 | 删除/伪造 `/sys/module` 视图或 kset 链接 | `modscan.ko` `modscan_scan.sh` `modscan_kcore` | **仅告警，不自动修复**；建议 kexec/可信重启 |
+| 链表无关隐藏（内存驻留） | 绕过 `modules` 链表，残留 `struct module` 对象 | `modscan_kcore`（内存 carving） | **仅告警，不自动修复**；建议 kexec/可信重启 |
 
 ### 检测工具（无需加载模块）
 
@@ -164,6 +169,8 @@ kdb> mm <list.next_addr> <value>    # 直接写指针，重新链接模块
 ```
                       modscan.ko  modscan_scan.sh  modscan_kcore
 DKOM list_del 隐藏        ✓             ✓               ✓
+module_kset/sysfs 篡改     ✓(反向对比)    ✓(反向对比)      ✓(三视图交叉验证)
+链表无关隐藏(carving)      ✗             ✗               ✓(内存特征扫描)
 modules_disabled=1        N/A           ✓               ✓
 finit_module 内联 patch   N/A           ✓(需python3)    ✓
 系统调用表劫持             N/A           ✓(需python3)    ✓
@@ -176,4 +183,5 @@ LSM hook 插入             N/A           ✗               部分
 - 需要 root 权限（`CAP_SYS_MODULE`）
 - `/proc/modscan` 权限为 0600，只有 root 可读写
 - 在启用了 `CONFIG_RANDSTRUCT`（结构体布局随机化）的内核上，`struct module_kobject` 的字段顺序可能与预期不同，但由于我们使用相同内核头文件编译，`container_of` 偏移量是一致的
-- 本工具仅针对通过 `list_del` 隐藏的模块；同时还修改了 kset 的 rootkit 不在本工具检测范围内
+- 对 `module_kset`/sysfs 篡改仅做检测告警，不做自动修复（避免在未知污染状态下误改链表）
+- `modscan_kcore` 的 carving 基于 `struct module` 特征与启发式评分；在裁剪内核/强随机化场景可能出现误报或漏报，建议结合多视图结果一起判断
