@@ -97,10 +97,9 @@ static int __init resolve_kallsyms(void)
  * module_mutex is GPL-exported so we can reference it directly;
  * the other two are static in the kernel and found via kallsyms.
  */
-extern struct mutex module_mutex;
-
 static struct list_head *modules_list_head;
 static struct kset      *modscan_kset;
+static struct mutex     *modscan_module_mutex;
 
 static int __init resolve_symbols(void)
 {
@@ -125,6 +124,18 @@ static int __init resolve_symbols(void)
 	}
 	modscan_kset = *kset_ptr;
 	pr_info("modscan: module_kset @ %px\n", modscan_kset);
+
+	/*
+	 * module_mutex is no longer exported on kernels >= 6.1.
+	 * Resolve it via kallsyms.
+	 */
+	modscan_module_mutex = (struct mutex *)
+		modscan_kallsyms("module_mutex");
+	if (!modscan_module_mutex) {
+		pr_err("modscan: symbol 'module_mutex' not found\n");
+		return -ENOENT;
+	}
+	pr_info("modscan: module_mutex @ %px\n", modscan_module_mutex);
 
 	return 0;
 }
@@ -228,6 +239,7 @@ static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
 	struct file *f;
 	loff_t pos = 0;
 	ssize_t n;
+	int i, j;
 
 	syms = kmalloc_array(max_syms, sizeof(*syms), GFP_KERNEL);
 	if (!syms)
@@ -240,22 +252,31 @@ static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
 	}
 
 	while (n_syms < max_syms) {
+		char *bracket;
+		char *end;
+		int modlen;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 		n = kernel_read(f, line, sizeof(line) - 1, &pos);
+#else
+		n = kernel_read(f, pos, line, sizeof(line) - 1);
+		pos += n;
+#endif
 		if (n <= 0)
 			break;
 		line[n] = '\0';
 
 		/* Find the [module_name] suffix */
-		char *bracket = strchr(line, '[');
+		bracket = strchr(line, '[');
 		if (!bracket)
 			continue;
 		bracket++;
 
-		char *end = strchr(bracket, ']');
+		end = strchr(bracket, ']');
 		if (!end)
 			continue;
 
-		int modlen = (int)(end - bracket);
+		modlen = (int)(end - bracket);
 		if (modlen <= 0 || modlen >= MODULE_NAME_LEN)
 			continue;
 
@@ -267,7 +288,9 @@ static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
 	filp_close(f, NULL);
 
 	/* Check each module name against the modules list */
-	for (int i = 0; i < n_syms; i++) {
+	for (i = 0; i < n_syms; i++) {
+		bool found;
+
 		/* Skip built-in kernel symbols and ourselves */
 		if (strcmp(syms[i].modname, THIS_MODULE->name) == 0)
 			continue;
@@ -277,8 +300,8 @@ static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
 			continue;
 
 		/* Check if already in orphan list */
-		bool found = false;
-		for (int j = 0; j < n_orphans; j++) {
+		found = false;
+		for (j = 0; j < n_orphans; j++) {
 			if (strcmp(orphans[j].name, syms[i].modname) == 0) {
 				orphans[j].sym_count++;
 				found = true;
@@ -305,7 +328,7 @@ static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
 static int modscan_show(struct seq_file *m, void *v)
 {
 	struct modscan_snap *snap;
-	struct modscan_orphan orphans[MODSCAN_ORPHAN_MAX];
+	struct modscan_orphan *orphans;
 	int i, n = 0, n_hidden = 0, n_orphan = 0;
 
 	seq_puts(m, "=== ModScan: Hidden Module Scan ===\n\n");
@@ -318,7 +341,7 @@ static int modscan_show(struct seq_file *m, void *v)
 	if (IS_ERR(snap))
 		return PTR_ERR(snap);
 
-	if (mutex_lock_killable(&module_mutex)) {
+	if (mutex_lock_killable(modscan_module_mutex)) {
 		kfree(snap);
 		return -EINTR;
 	}
@@ -332,12 +355,19 @@ static int modscan_show(struct seq_file *m, void *v)
 		}
 	}
 
-	mutex_unlock(&module_mutex);
+	mutex_unlock(modscan_module_mutex);
 	kfree(snap);
 
 	/* ------------------------------------------------------------------ */
 	/* Phase 2: kallsyms orphans (detects rootkits that also tamper kset)  */
 	/* ------------------------------------------------------------------ */
+
+	orphans = kmalloc_array(MODSCAN_ORPHAN_MAX, sizeof(*orphans),
+				GFP_KERNEL);
+	if (!orphans) {
+		seq_puts(m, "WARNING: kallsyms orphan scan skipped (ENOMEM)\n");
+		goto summary;
+	}
 
 	n_orphan = scan_kallsyms_orphans(orphans, MODSCAN_ORPHAN_MAX);
 	if (n_orphan < 0) {
@@ -353,10 +383,13 @@ static int modscan_show(struct seq_file *m, void *v)
 		}
 	}
 
+	kfree(orphans);
+
 	/* ------------------------------------------------------------------ */
 	/* Summary                                                            */
 	/* ------------------------------------------------------------------ */
 
+summary:
 	if (n_hidden == 0 && n_orphan <= 0)
 		seq_puts(m, "\n(no hidden modules detected)\n");
 	else
@@ -432,11 +465,11 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	}
 
 	/* Step 2 — re-link under module_mutex */
-	if (mutex_lock_killable(&module_mutex))
+	if (mutex_lock_killable(modscan_module_mutex))
 		return -EINTR;
 
 	if (name_in_modules_list(modname)) {
-		mutex_unlock(&module_mutex);
+		mutex_unlock(modscan_module_mutex);
 		pr_info("modscan: '%s' is already in the modules list\n",
 			modname);
 		return -EEXIST;
@@ -449,7 +482,7 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	 * After this, /proc/modules (lsmod) and rmmod will find the module.
 	 */
 	list_add(&target->list, modules_list_head);
-	mutex_unlock(&module_mutex);
+	mutex_unlock(modscan_module_mutex);
 
 	pr_info("modscan: module '%s' restored to modules list\n", modname);
 	return count;
