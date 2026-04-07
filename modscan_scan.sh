@@ -10,9 +10,8 @@
 #   4. finit_module / init_module / load_module / tcp4_seq_show 等内联 patch 检测（需要 /proc/kcore）
 #   5. 系统调用表指针劫持检测，含 getdents/getdents64（需要 /proc/kcore）
 #   6. kset/sysfs 四维交叉验证（含 stat 绕过 getdents64 hook，检测 Skidmap 文件隐藏）
-#   7. /proc/vmallocinfo 模块内存分配交叉验证（独立于所有链表追踪结构）
-#   8. sig_enforce 状态
-#   9. Skidmap 恶意软件特征（已知模块名、ld.so.preload、PAM 后门、cron 持久化）
+#   7. sig_enforce 状态
+#   8. Skidmap 恶意软件特征（已知模块名、ld.so.preload、PAM 后门、cron 持久化）
 #
 # 用法: sudo bash modscan_scan.sh
 #
@@ -128,6 +127,22 @@ check_modules_consistency() {
         ok "  /sys/module/ 和 /proc/modules 一致（未发现 DKOM 隐藏模块）"
     else
         alert "  共发现 $hidden 个 DKOM 隐藏模块"
+    fi
+
+    # 反向检测：/proc/modules 中有，但 stat 访问 sysfs initstate 失败
+    # stat 使用 newfstatat，不经过 getdents64，即使 getdents64 被 hook 也能访问
+    # 如果 stat 失败，说明 sysfs 条目已被删除（kobject_del）
+    local sysfs_missing=0
+    while read -r mname _rest; do
+        if [[ ! -f "/sys/module/${mname}/initstate" ]]; then
+            alert "  SYSFS-MISSING: '$mname' 在 /proc/modules 中，但 /sys/module/${mname}/initstate 不存在"
+            alert "    → 该模块的 sysfs 条目已被删除（kobject_del）或被内核内建模块覆盖"
+            flag
+            sysfs_missing=$(( sysfs_missing + 1 ))
+        fi
+    done < /proc/modules
+    if [[ $sysfs_missing -eq 0 ]]; then
+        ok "  /proc/modules 中所有模块均有对应 sysfs 条目（stat 探测，绕过 getdents64）"
     fi
 }
 
@@ -555,6 +570,14 @@ print(f"    kcore kset 遍历结果          : {len(kset_names)} 个模块 kobje
 print(f"    /sys/module/ readdir 视图    : {len(sysfs_via_readdir)} 个 LKM（可能被 hook 过滤）")
 print(f"    /proc/modules 视图           : {len(proc_mods)} 个模块\n")
 
+# kset 遍历合理性检查：如果结果远少于 /proc/modules，说明遍历失败（kcore 读取不完整或
+# module_kset 符号不在 kallsyms）；此时 KSET-TAMPER 和 SYSFS-TAMPER 比对不可靠
+kset_walk_valid = len(kset_names) >= max(2, len(proc_mods) // 2)
+if not kset_walk_valid:
+    print(f"  \033[1;33m[!]\033[0m kset 遍历结果 ({len(kset_names)}) 远少于 /proc/modules"
+          f" ({len(proc_mods)})，跳过 KSET-TAMPER 和 SYSFS-TAMPER 比对")
+    print(f"      （可能原因：module_kset 不在 kallsyms 或 kcore 段读取不完整）")
+
 findings = 0
 
 for name, (kobj, sd) in kset_names.items():
@@ -578,14 +601,17 @@ for name, (kobj, sd) in kset_names.items():
 
     elif not sysfs_stat_ok and not in_readdir:
         # ── A: sysfs 条目已被真正删除 ──
-        extra = ""
+        # 仅当模块同时在 /proc/modules 中时才报告：kset 条目不在 proc_mods 也不在 sysfs，
+        # 很可能是 kcore 读取产生的垃圾条目（名称指针读错），而非真实的篡改事件
         if not in_proc:
-            extra = "（高级双重 DKOM，kset 中仍有残留）"
-        print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中，")
-        print(f"            但 stat 和 readdir 均无法访问 /sys/module/{name}/ {extra}")
-        print(f"            → sysfs 条目已被删除（kernfs_remove / kobject_del）")
-        print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
-        findings += 1
+            # kset 条目不在 sysfs 也不在 proc_mods → 可能是 kcore walk 的假条目，跳过
+            pass
+        elif kset_walk_valid:
+            print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中，")
+            print(f"            但 stat 和 readdir 均无法访问 /sys/module/{name}/")
+            print(f"            → sysfs 条目已被删除（kernfs_remove / kobject_del）")
+            print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
+            findings += 1
 
     elif sd == 0 and sysfs_stat_ok:
         # ── B2: kobject.sd==NULL 但 sysfs 目录仍存在 —— 不一致状态 ──
@@ -595,12 +621,14 @@ for name, (kobj, sd) in kset_names.items():
         findings += 1
 
 # ── C: readdir 看到的但 kcore kset 没有 ─────────────────────────────────────
-for name in sysfs_via_readdir:
-    if name not in kset_names:
-        print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 在 readdir 中可见，")
-        print(f"            但不在 kcore kset 链表中！")
-        print(f"            → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留")
-        findings += 1
+# 仅当 kset 遍历结果可信时才进行此比对；若遍历失败（结果过少），跳过以避免误报
+if kset_walk_valid:
+    for name in sysfs_via_readdir:
+        if name not in kset_names:
+            print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 在 readdir 中可见，")
+            print(f"            但不在 kcore kset 链表中！")
+            print(f"            → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留")
+            findings += 1
 
 if findings == 0:
     print("\033[0;32m    [+]\033[0m 四维一致（kcore kset / stat / readdir / /proc/modules）未发现篡改")
@@ -616,114 +644,10 @@ PYEOF
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 7: /proc/vmallocinfo 模块内存分配交叉验证
-#
-# 原理：
-#   模块代码/数据通过 module_alloc()/load_module() 分配 vmalloc 内存，
-#   分配记录在 /proc/vmallocinfo 中，调用链包含 "load_module" 或 "module_alloc"。
-#   即使 rootkit 从 /proc/modules、kset、sysfs 中删除自身，其 vmalloc 内存
-#   分配通常仍残留在 /proc/vmallocinfo，因为 vmallocinfo 使用完全不同的代码路径，
-#   远比 /proc/modules 或 /sys/module/ 更难以同时伪造。
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-check_vmallocinfo() {
-    info "CHECK 7: /proc/vmallocinfo 模块内存分配交叉验证"
-
-    if [[ ! -r /proc/vmallocinfo ]]; then
-        warn "  /proc/vmallocinfo 不可读——跳过此项检测"
-        return
-    fi
-    if ! command -v python3 &>/dev/null; then
-        warn "  python3 未找到——跳过 vmallocinfo 检测"
-        return
-    fi
-
-    local py_ret=0
-    python3 - <<'PYEOF' || py_ret=$?
-import re, sys, os
-
-# ── 从 /proc/modules 构建已知模块地址范围 ────────────────────────────────────
-mod_ranges = {}  # name → (start, end)
-try:
-    with open('/proc/modules') as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 6:
-                continue
-            name     = parts[0]
-            size     = int(parts[1])
-            addr_str = parts[-1].strip()
-            if addr_str.startswith('0x'):
-                addr = int(addr_str, 16)
-                if addr and size:
-                    mod_ranges[name] = (addr, addr + size)
-except Exception as e:
-    print(f"  [!] 无法读取 /proc/modules: {e}", file=sys.stderr)
-
-print(f"    /proc/modules 中已知 {len(mod_ranges)} 个模块地址范围")
-
-# ── 扫描 /proc/vmallocinfo ───────────────────────────────────────────────────
-# 格式: 0xSTART-0xEND  SIZE  CALLCHAIN...
-pat = re.compile(r'^0x([0-9a-f]+)-0x([0-9a-f]+)\s+(\d+)\s+(.*)', re.IGNORECASE)
-
-found = 0
-ghost = 0
-try:
-    with open('/proc/vmallocinfo') as f:
-        for line in f:
-            m = pat.match(line)
-            if not m:
-                continue
-            va_start = int(m.group(1), 16)
-            va_end   = int(m.group(2), 16)
-            va_size  = int(m.group(3))
-            info     = m.group(4).strip()
-
-            # 只关注由模块加载代码创建的分配
-            is_mod = ('load_module'    in info or
-                      'module_alloc'   in info or
-                      'move_module'    in info or
-                      'do_init_module' in info)
-            if not is_mod:
-                continue
-
-            found += 1
-
-            # 检查是否被已知模块地址范围覆盖（两段区间有重叠）
-            covered = any(
-                va_start < end and va_end > start
-                for (start, end) in mod_ranges.values()
-            )
-
-            if not covered:
-                print(f"\033[0;31m    [ALERT]\033[0m GHOST ALLOC: {va_start:#x}-{va_end:#x} ({va_size} 字节)")
-                print(f"            调用链: {info[:120]}")
-                print(f"            → vmalloc 由模块加载代码分配，但不被 /proc/modules 中任何模块覆盖！")
-                print(f"            → 这可能是已从所有追踪结构中删除自身的隐藏模块的代码/数据段")
-                ghost += 1
-
-except Exception as e:
-    print(f"  [!] 读取 /proc/vmallocinfo 出错: {e}", file=sys.stderr)
-    sys.exit(2)
-
-print(f"\n    共扫描 {found} 个模块 vmalloc 分配，其中 {ghost} 个无主")
-if ghost == 0:
-    print("\033[0;32m    [+]\033[0m 所有模块 vmalloc 分配均被已知模块覆盖")
-
-sys.exit(1 if ghost > 0 else 0)
-PYEOF
-
-    if [[ $py_ret -eq 1 ]]; then
-        flag
-    elif [[ $py_ret -eq 2 ]]; then
-        warn "  vmallocinfo 检测因错误中止"
-    fi
-}
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 8: 模块签名强制检测
+# CHECK 7: 模块签名强制检测
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_sig_enforce() {
-    info "CHECK 8: 模块签名强制 (sig_enforce)"
+    info "CHECK 7: 模块签名强制 (sig_enforce)"
 
     local SIG=/proc/sys/kernel/sig_enforce
     if [[ ! -f "$SIG" ]]; then
@@ -742,7 +666,7 @@ check_sig_enforce() {
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 7: Skidmap 恶意软件特征检测
+# CHECK 8: Skidmap 恶意软件特征检测
 #
 # Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，通过内核模块实现：
 #   - 劫持 getdents64 隐藏挖矿相关文件（CHECK 4+5 已检测）
@@ -753,10 +677,10 @@ check_sig_enforce() {
 #   - 在 cron 中写入持久化脚本
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_skidmap() {
-    info "CHECK 9: Skidmap 恶意软件特征检测"
+    info "CHECK 8: Skidmap 恶意软件特征检测"
 
     # ── 7-1. 已知 Skidmap 内核模块名扫描 ─────────────────────────────────────
-    info "  [7-1] 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）"
+    info "  [8-1] 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）"
     # 模块名来源：Trend Micro、AT&T Alien Labs 等公开样本分析报告
     local -a SKIDMAP_MODS=(iproute netlink mstf bcmap kaudited kbuild pc_keyb snd_floppy)
     local skid_mod_found=0
@@ -800,7 +724,7 @@ check_skidmap() {
     fi
 
     # ── 7-2. /etc/ld.so.preload 检测 ─────────────────────────────────────────
-    info "  [7-2] /etc/ld.so.preload 检测（用户态文件隐藏后门）"
+    info "  [8-2] /etc/ld.so.preload 检测（用户态文件隐藏后门）"
     # 部分 Skidmap 变种通过此文件预加载恶意共享库，实现用户态文件/进程隐藏
     if [[ -f /etc/ld.so.preload ]]; then
         if [[ ! -s /etc/ld.so.preload ]]; then
@@ -817,7 +741,7 @@ check_skidmap() {
     fi
 
     # ── 7-3. PAM 后门检测 ────────────────────────────────────────────────────
-    info "  [7-3] PAM 后门检测（pam_unix.so 完整性）"
+    info "  [8-3] PAM 后门检测（pam_unix.so 完整性）"
     # Skidmap 将 pam_unix.so 替换为恶意版本，使其接受任意密码
     # 恶意版体积通常远小于正常版（<50KB vs >80KB）
     local pam_file=""
@@ -851,7 +775,7 @@ check_skidmap() {
     fi
 
     # ── 7-4. Skidmap cron 持久化检测 ─────────────────────────────────────────
-    info "  [7-4] Skidmap cron 持久化检测"
+    info "  [8-4] Skidmap cron 持久化检测"
     # Skidmap 在 /etc/cron.d/ 中写入使用其伪装模块名命名的 cron 文件
     local -a SKIDMAP_CRON_FILES=(
         /etc/cron.d/iproute
@@ -891,8 +815,6 @@ echo
 check_hooks_via_kcore
 echo
 check_kset_sysfs
-echo
-check_vmallocinfo
 echo
 check_sig_enforce
 echo
