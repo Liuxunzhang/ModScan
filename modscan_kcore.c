@@ -1531,6 +1531,114 @@ static void check_skidmap_indicators(void)
         ok("  未发现 Skidmap 特征 cron 文件");
 }
 
+/* ─── CHECK 10: 模块地址范围暴力扫描（最后防线）────────────────────────────
+ *
+ * 当 rootkit 清除了所有追踪结构（modules 链表、module_kset、vmap_area_list）
+ * 时，唯一可靠的用户态检测方法是直接读取模块 vmalloc 地址范围，寻找
+ * struct module 签名。这与 Volatility 3 对内存镜像的扫描等价，但通过
+ * /proc/kcore 实现（注意：3.10 内核 kcore 可能不包含 vmalloc 页）。
+ *
+ * x86-64 模块 vmalloc 范围（3.10–6.x 稳定）：
+ *   0xffffffffa0000000 – 0xfffffffffff00000  (~1.5GB, ~390K 页)
+ *
+ * 扫描策略：每 PAGE_SIZE=4096 字节读 80 字节，kcore_read 失败表示未映射。
+ */
+#define MODULES_VADDR_X86  0xffffffffa0000000ULL
+#define MODULES_END_X86    0xfffffffffff00000ULL
+
+static void check_module_range_scan(void)
+{
+    info("CHECK 10: 模块 vmalloc 范围暴力扫描（最后防线，不依赖任何追踪结构）");
+    printf("  原理：逐页探测 x86-64 模块 vmalloc 范围，寻找 struct module 签名，\n"
+           "        不依赖 modules 链表/kset/vmap_area_list 中的任何一项。\n"
+           "        注意：3.10 内核 /proc/kcore 可能不包含 vmalloc 页（需用 modscan.ko）。\n\n");
+
+    if (kcore_fd < 0) {
+        warn("  /proc/kcore 不可用，跳过");
+        return;
+    }
+
+    uint64_t scan_start = MODULES_VADDR_X86;
+    uint64_t scan_end   = MODULES_END_X86;
+    uint64_t step       = 4096;
+
+    printf("    扫描范围: %#lx – %#lx  (%llu 页)\n\n",
+           (unsigned long)scan_start, (unsigned long)scan_end,
+           (unsigned long long)((scan_end - scan_start) / step));
+
+    int mapped = 0, found = 0, hidden = 0;
+    uint8_t buf[MOD_SIG_BYTES];
+
+    for (uint64_t addr = scan_start; addr < scan_end; addr += step) {
+        if (kcore_read(addr, buf, MOD_SIG_BYTES) != MOD_SIG_BYTES)
+            continue;
+
+        mapped++;
+
+        /* [1] state: 0–3 */
+        uint32_t state;
+        memcpy(&state, buf + 0, 4);
+        if (state > 3)
+            continue;
+
+        /* [2] list.next / list.prev: 有效内核指针 */
+        uint64_t lnext, lprev;
+        memcpy(&lnext, buf + 8,  8);
+        memcpy(&lprev, buf + 16, 8);
+        if (!IS_KADDR(lnext) || !IS_KADDR(lprev))
+            continue;
+
+        /* [3] name: 可打印 ASCII */
+        char name[MODULE_NAME_LEN + 1];
+        memcpy(name, buf + 24, MODULE_NAME_LEN);
+        name[MODULE_NAME_LEN] = '\0';
+        char c0 = name[0];
+        if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') ||
+              (c0 >= '0' && c0 <= '9') || c0 == '_'))
+            continue;
+        int nlen = -1;
+        for (int i = 0; i < MODULE_NAME_LEN; i++) {
+            if (name[i] == '\0') { nlen = i; break; }
+            if ((uint8_t)name[i] < 0x20 || (uint8_t)name[i] >= 0x7f) break;
+        }
+        if (nlen <= 0)
+            continue;
+
+        /* [4] 链表向前验证: list.next - 8 也有合法 state */
+        uint32_t ns = 0xff;
+        if (kcore_read(lnext - 8, &ns, 4) != 4 || ns > 3)
+            continue;
+
+        /* [5] 链表向后验证: list.prev - 8 也有合法 state */
+        uint32_t ps = 0xff;
+        if (kcore_read(lprev - 8, &ps, 4) != 4 || ps > 3)
+            continue;
+
+        found++;
+
+        bool in_proc = name_in_list(name, procmod_list, procmod_list_n);
+        if (!in_proc) {
+            alert("  HIDDEN MODULE (原始内存扫描): '%s'", name);
+            printf("       struct module @ %#lx  state=%u\n",
+                   (unsigned long)addr, state);
+            printf("       list.next=%#lx  list.prev=%#lx\n",
+                   (unsigned long)lnext, (unsigned long)lprev);
+            printf("       → 不依赖任何内核追踪结构直接发现\n"
+                   "       → 与 Volatility 3 raw memory scan 等价方法\n");
+            FINDING();
+            hidden++;
+        }
+    }
+
+    printf("    映射页: %d，struct module 签名: %d，隐藏: %d\n",
+           mapped, found, hidden);
+    if (mapped == 0)
+        warn("  kcore 未返回任何模块范围页面 → 3.10 内核 kcore 不含 vmalloc 页\n"
+             "  ★ 使用 modscan.ko (内核态) 进行原始扫描: cat /proc/modscan");
+    else if (hidden == 0 && found > 0)
+        ok("  原始内存扫描：未发现隐藏模块");
+}
+
 /* ─── 主函数 ─────────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -1577,6 +1685,7 @@ int main(void)
         check_syscall_table();        printf("\n");
         check_struct_module_scan();   printf("\n");
         check_vmap_area_list_scan();  printf("\n");
+        check_module_range_scan();    printf("\n");
     }
 
     check_skidmap_indicators(); printf("\n");

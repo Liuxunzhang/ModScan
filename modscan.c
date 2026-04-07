@@ -208,6 +208,16 @@ static bool name_in_modules_list(const char *name)
 /* ------------------------------------------------------------------ */
 
 /*
+ * MODULE_STATE_UNFORMED was added in kernel 3.14.
+ * On older kernels (e.g. 3.10/RHEL7) only LIVE/COMING/GOING (0-2) exist.
+ * Defining it here allows the same state check (state > MODULE_STATE_UNFORMED)
+ * to compile and work on both old and new kernels.
+ */
+#ifndef MODULE_STATE_UNFORMED
+# define MODULE_STATE_UNFORMED 3
+#endif
+
+/*
  * struct vmap_area layout (x86-64) differs by kernel version:
  *
  * Linux < 5.7  (flags field before rb_node):
@@ -407,6 +417,189 @@ static void modscan_vmap_scan(struct seq_file *m)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Raw module range scan — Volatility 3 equivalent for live kernels   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * On kernel 3.10 (RHEL7), a sophisticated rootkit can hide itself by
+ * cleaning up ALL kernel tracking structures:
+ *   - list_del()   from the modules linked list
+ *   - kobject_del() from module_kset (sysfs)
+ *   - clearing     vmap_area.vm pointer (or removing from vmap_area_list)
+ *
+ * After this, NO linked-list-based scanner can find the module.
+ * Volatility 3 finds it by scanning a raw memory dump for struct module
+ * signatures. This function is the live-kernel equivalent:
+ *
+ *   Scan every page in [MODULES_VADDR, MODULES_END] with
+ *   probe_kernel_read() / copy_from_kernel_nofault().
+ *   The hidden module's code/data is still mapped (it's still running),
+ *   so the reads succeed and the struct module signature is visible.
+ *
+ * This does NOT rely on:
+ *   modules list, module_kset, vmap_area_list, /proc/modules,
+ *   /sys/module/, /proc/vmallocinfo — all of which can be tampered.
+ *
+ * MODULES_VADDR / MODULES_END on x86-64:
+ *   kernel 3.10-6.x:  0xffffffffa0000000 – 0xfffffffffff00000
+ *   (~1.5 GB range, ~390K pages; ~80-400 ms scan with nofault probing)
+ *
+ * Performance: the function probes MOD_SIG_BYTES (80B) per page.
+ * Unmapped pages return immediately (-EFAULT). Mapped non-module pages
+ * fail the state/pointer/name checks quickly. Only genuine struct module
+ * pages pass all five criteria and trigger a full report.
+ */
+
+/* Candidate found during the raw scan (stored before mutex is taken) */
+#define MODSCAN_MAX_CANDS 512
+
+struct modscan_cand {
+	unsigned long addr;
+	u32           state;
+	char          name[MODULE_NAME_LEN + 1];
+};
+
+static void modscan_raw_scan(struct seq_file *m)
+{
+	struct modscan_cand *cands;
+	int ncands = 0, n_visible = 0, hidden = 0;
+	unsigned long addr;
+
+#ifndef MODULES_VADDR
+	seq_puts(m, "  (MODULES_VADDR not defined — x86-64 only)\n");
+	return;
+#else
+	const unsigned long raw_start = MODULES_VADDR;
+	const unsigned long raw_end   = MODULES_END;
+
+	seq_printf(m, "  Raw scan: 0x%lx – 0x%lx  (%lu pages)\n\n",
+		   raw_start, raw_end,
+		   (raw_end - raw_start) >> PAGE_SHIFT);
+
+	cands = kmalloc_array(MODSCAN_MAX_CANDS, sizeof(*cands), GFP_KERNEL);
+	if (!cands) {
+		seq_puts(m, "  OOM — cannot allocate candidate buffer\n");
+		return;
+	}
+
+	/*
+	 * Phase 1 — raw page probe (no lock needed).
+	 *
+	 * For each page: read the first 80 bytes with fault-safe accessor.
+	 * Unmapped pages return -EFAULT and are skipped instantly.
+	 * Mapped pages have their first 80 bytes checked against the
+	 * struct module signature (5-stage filter).
+	 */
+	for (addr = raw_start;
+	     addr < raw_end && ncands < MODSCAN_MAX_CANDS;
+	     addr += PAGE_SIZE) {
+
+		u8  buf[80];          /* covers state(4)+pad(4)+list(16)+name(56) */
+		u32 state;
+		unsigned long lnext, lprev;
+		char name[MODULE_NAME_LEN + 1];
+
+		/* One fault-safe read for the whole signature block */
+		if (vmscan_read(buf, (void *)addr, sizeof(buf)))
+			continue;
+
+		/* [1] state: 0–MODULE_STATE_UNFORMED */
+		memcpy(&state, buf + 0, 4);
+		if (state > MODULE_STATE_UNFORMED)
+			continue;
+
+		/* [2] list.next / list.prev: valid kernel pointer, 8B-aligned */
+		memcpy(&lnext, buf + 8,  8);
+		memcpy(&lprev, buf + 16, 8);
+		if (!vmscan_is_kptr(lnext) || !vmscan_is_kptr(lprev))
+			continue;
+
+		/* [3] name[56]: printable ASCII, non-empty, NUL-terminated */
+		memcpy(name, buf + 24, MODULE_NAME_LEN);
+		name[MODULE_NAME_LEN] = '\0';
+		{
+			char c0 = name[0];
+			int i, nlen = -1;
+			if (!((c0 >= 'a' && c0 <= 'z') ||
+			      (c0 >= 'A' && c0 <= 'Z') ||
+			      (c0 >= '0' && c0 <= '9') || c0 == '_'))
+				continue;
+			for (i = 0; i < MODULE_NAME_LEN; i++) {
+				if (name[i] == '\0') { nlen = i; break; }
+				if ((unsigned char)name[i] < 0x20 ||
+				    (unsigned char)name[i] >= 0x7f)
+					break;
+			}
+			if (nlen <= 0)
+				continue;
+		}
+
+		/* [4] Chain cross-check: *(list.next - 8) must also be valid state */
+		{
+			u32 ns = 0xff;
+			if (vmscan_read(&ns, (void *)(lnext - 8), 4) ||
+			    ns > MODULE_STATE_UNFORMED)
+				continue;
+		}
+
+		/* [5] Symmetry check: *(list.prev - 8) must also be valid state */
+		{
+			u32 ps = 0xff;
+			if (vmscan_read(&ps, (void *)(lprev - 8), 4) ||
+			    ps > MODULE_STATE_UNFORMED)
+				continue;
+		}
+
+		/* All five checks passed — record as candidate */
+		cands[ncands].addr  = addr;
+		cands[ncands].state = state;
+		memcpy(cands[ncands].name, name, MODULE_NAME_LEN + 1);
+		ncands++;
+	}
+
+	/*
+	 * Phase 2 — compare candidates against modules list (brief mutex hold).
+	 *
+	 * We hold module_mutex only for the list walk, not during the scan,
+	 * so rmmod/insmod are blocked for milliseconds at most.
+	 */
+	if (ncands > 0) {
+		if (mutex_lock_killable(&module_mutex) == 0) {
+			int i;
+			for (i = 0; i < ncands; i++) {
+				if (name_in_modules_list(cands[i].name)) {
+					n_visible++;
+				} else {
+					seq_printf(m,
+						"RAW-HIDDEN   %-20s"
+						"  @ 0x%lx  state=%u\n",
+						cands[i].name,
+						cands[i].addr,
+						cands[i].state);
+					hidden++;
+				}
+			}
+			mutex_unlock(&module_mutex);
+		} else {
+			seq_puts(m, "  (interrupted — could not acquire module_mutex)\n");
+		}
+	}
+
+	kfree(cands);
+
+	seq_printf(m,
+		   "  Result: %d module signatures found"
+		   " (%d visible, %d HIDDEN)\n",
+		   ncands, n_visible, hidden);
+	if (ncands == 0)
+		seq_puts(m, "  (no mapped pages found in module range"
+			    " — probe_kernel_read may lack vmalloc access)\n");
+	else if (hidden == 0)
+		seq_puts(m, "  (all found modules are in the modules list)\n");
+#endif /* MODULES_VADDR */
+}
+
+/* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
 
@@ -497,6 +690,16 @@ static int modscan_show(struct seq_file *m, void *v)
 		modscan_vmap_scan(m);
 		mutex_unlock(&module_mutex);
 	}
+
+	/*
+	 * Raw module range scan — last resort, catches rootkits that clean up
+	 * ALL tracking structures (modules list + kset + vmap_area_list).
+	 * Directly probes every page in [MODULES_VADDR, MODULES_END] for a
+	 * struct module signature. Does not acquire any lock during the scan.
+	 * Equivalent to what Volatility 3 does on a live memory dump.
+	 */
+	seq_puts(m, "\n=== Raw Module Range Scan (Last Resort) ===\n\n");
+	modscan_raw_scan(m);
 
 	return 0;
 }
