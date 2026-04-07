@@ -820,7 +820,89 @@ static int modscan_show(struct seq_file *m, void *v)
 		seq_printf(m, "\n%d sysfs-tampered module(s) found.\n",
 			   n_sysfs_tampered);
 
-	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
+	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n"
+	            "           echo 'restore-addr <hex>' > /proc/modscan\n");
+
+	/*
+	 * === Module metadata audit ===
+	 *
+	 * For each module in the modules list, show core_size, init_size, refcnt.
+	 * Rootkits set these to 0xFFFFFFFE (-2 as signed) to impede removal.
+	 */
+	seq_puts(m, "\n=== Module Metadata Audit (detect field corruption) ===\n\n");
+	{
+		struct module *mod;
+		int n_corrupt = 0;
+
+		if (mutex_lock_killable(&module_mutex) == 0) {
+			list_for_each_entry(mod, modules_list_head, list) {
+				int rc = atomic_read(&mod->refcnt);
+				unsigned int csz = mod->core_size;
+				unsigned int isz = mod->init_size;
+				/* Legitimate: csz > 0, isz >= 0, rc >= 0 */
+				if (rc < 0 || csz == 0 || csz > (256u << 20)) {
+					seq_printf(m,
+						   "CORRUPT-FIELDS  %-20s"
+						   "  core_sz=%u init_sz=%u refcnt=%d\n",
+						   mod->name, csz, isz, rc);
+					n_corrupt++;
+				}
+			}
+			mutex_unlock(&module_mutex);
+		}
+		if (n_corrupt == 0)
+			seq_puts(m, "  (all module fields look normal)\n");
+		else
+			seq_printf(m,
+				   "  %d module(s) with corrupted fields.\n"
+				   "  Fix refcnt before rmmod: echo 'fix-refcnt <hex>'"
+				   " > /proc/modscan\n", n_corrupt);
+	}
+
+	/*
+	 * === Syscall table audit ===
+	 *
+	 * Check whether sys_call_table[__NR_delete_module] still points into
+	 * legitimate kernel text.  A hooked entry explains why rmmod returns
+	 * ENOENT for modules that lsmod can see.
+	 */
+	seq_puts(m, "\n=== Syscall Table Audit ===\n\n");
+	{
+		unsigned long *sct;
+		unsigned long fn, ks, ke;
+
+		sct = (unsigned long *)modscan_kallsyms("sys_call_table");
+		ks  = modscan_kallsyms("_stext");
+		ke  = modscan_kallsyms("_etext");
+
+		if (!sct || !ks || !ke) {
+			seq_puts(m, "  (sys_call_table/_stext/_etext not in"
+				    " kallsyms — need CONFIG_KALLSYMS_ALL=y)\n");
+		} else {
+			/* __NR_delete_module = 176 on x86-64 */
+			fn = sct[176];
+			if (fn >= ks && fn <= ke) {
+				seq_printf(m,
+					   "  sys_call_table[176] (delete_module)"
+					   " = 0x%lx  [OK — in kernel text]\n",
+					   fn);
+			} else {
+				seq_printf(m,
+					   "SYSCALL-HOOK  sys_call_table[176]"
+					   " = 0x%lx  [OUTSIDE kernel text"
+					   " 0x%lx-0x%lx] — rmmod is hooked!\n",
+					   fn, ks, ke);
+			}
+
+			/* Also check sys_init_module [NR=175] for completeness */
+			fn = sct[175];
+			if (fn < ks || fn > ke)
+				seq_printf(m,
+					   "SYSCALL-HOOK  sys_call_table[175]"
+					   " (init_module) = 0x%lx  [OUTSIDE"
+					   " kernel text]\n", fn);
+		}
+	}
 
 	/*
 	 * === vmap_area_list scan (Volatility 3 method) ===
@@ -994,11 +1076,74 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	}
 #endif
 
+	/*
+	 * Command: fix-refcnt <hex>
+	 *
+	 * A rootkit that sets mod->core_size = 0xFFFFFFFE and
+	 * atomic_set(&mod->refcnt, -2) prevents clean removal even after the
+	 * module is restored to the modules list.  This command resets those
+	 * fields to legitimate values so rmmod --force can proceed.
+	 *
+	 * Supply the address from the Raw Module Range Scan output.
+	 *
+	 * Example:
+	 *   echo 'fix-refcnt 0xffffffffc0931a80' > /proc/modscan
+	 */
+#ifdef MODULES_VADDR
+	if (strncmp(kbuf, "fix-refcnt ", 11) == 0) {
+		unsigned long fix_addr = 0;
+		struct module *fmod;
+		u32 state = 0xff;
+		char fname[MODULE_NAME_LEN + 1] = {};
+
+		if (kstrtoul(kbuf + 11, 16, &fix_addr)) {
+			pr_err("modscan: fix-refcnt: bad hex address\n");
+			return -EINVAL;
+		}
+		if (fix_addr < MODULES_VADDR || fix_addr >= MODULES_END ||
+		    (fix_addr & 7)) {
+			pr_err("modscan: fix-refcnt: address out of range\n");
+			return -ERANGE;
+		}
+		if (vmscan_read(&state, (void *)fix_addr, 4) ||
+		    state > MODULE_STATE_UNFORMED) {
+			pr_err("modscan: fix-refcnt: invalid state at 0x%lx\n",
+			       fix_addr);
+			return -EINVAL;
+		}
+		if (vmscan_read(fname, (void *)(fix_addr + 24),
+				MODULE_NAME_LEN))
+			return -EINVAL;
+		fname[MODULE_NAME_LEN] = '\0';
+
+		fmod = (struct module *)fix_addr;
+
+		/*
+		 * Reset only the fields the rootkit corrupts to block removal:
+		 *   refcnt  → 0  (module has no users)
+		 *   state   → MODULE_STATE_LIVE  (was left as LIVE but be explicit)
+		 *
+		 * We do NOT guess at core_size/init_size; those are only used
+		 * for display in /proc/modules and for the freeing path, which
+		 * we skip here.  rmmod --force will trigger the exit() path
+		 * without checking size.
+		 */
+		atomic_set(&fmod->refcnt, 0);
+		fmod->state = MODULE_STATE_LIVE;
+
+		pr_info("modscan: fix-refcnt: '%s' @ 0x%lx"
+			" — refcnt reset to 0, state set LIVE\n",
+			fname, fix_addr);
+		return count;
+	}
+#endif
+
 	if (sscanf(kbuf, "restore %55s", modname) != 1) {
 		pr_err("modscan: unknown command '%s'\n"
 		       "modscan: usage:\n"
 		       "  echo 'restore <name>' > /proc/modscan\n"
-		       "  echo 'restore-addr <hex>' > /proc/modscan\n",
+		       "  echo 'restore-addr <hex>' > /proc/modscan\n"
+		       "  echo 'fix-refcnt <hex>' > /proc/modscan\n",
 		       kbuf);
 		return -EINVAL;
 	}
