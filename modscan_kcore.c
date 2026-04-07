@@ -458,6 +458,117 @@ static void check_hidden_modules(void)
         ok("  未发现 DKOM 隐藏模块");
 }
 
+/* ─── CHECK 2b: kallsyms 孤儿模块检测 ────────────────────────────────────── */
+/*
+ * 原理：
+ *   即使 rootkit 同时从 modules 链表和 module_kset 中摘除自身，
+ *   其符号通常仍保留在 /proc/kallsyms 中（格式：addr type sym [modname]）。
+ *   提取方括号中的模块名，与 /proc/modules 对比即可发现孤儿模块。
+ *
+ *   这可以检测到"同时篡改了 modules 链表和 kset"的高级 rootkit。
+ */
+
+#define KSYM_ORPHAN_MAX 64
+
+typedef struct {
+    char name[MODULE_NAME_LEN];
+    int  sym_count;
+} orphan_t;
+
+static void check_kallsyms_orphans(void)
+{
+    info("CHECK 2b: kallsyms 孤儿模块检测（对抗同时篡改 kset 的 rootkit）");
+
+    /* 收集 /proc/modules 中的模块名 */
+    FILE *f = fopen("/proc/modules", "r");
+    if (!f) {
+        warn("  无法打开 /proc/modules: %s", strerror(errno));
+        return;
+    }
+
+    /* 已知模块名列表 */
+    char known_mods[MAX_MODULES][MODULE_NAME_LEN];
+    int  known_n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) && known_n < MAX_MODULES) {
+        if (sscanf(line, "%55s", known_mods[known_n]) == 1)
+            known_n++;
+    }
+    fclose(f);
+
+    /* 重新扫描 kallsyms，提取 [module_name] 格式的符号 */
+    orphan_t orphans[KSYM_ORPHAN_MAX];
+    int orphan_n = 0;
+
+    f = fopen("/proc/kallsyms", "r");
+    if (!f) {
+        warn("  无法打开 /proc/kallsyms: %s", strerror(errno));
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        /* 格式: ffffffffa0000000 t func_name  [module_name] */
+        char *bracket = strchr(line, '[');
+        if (!bracket)
+            continue;
+        bracket++; /* skip '[' */
+
+        char *end = strchr(bracket, ']');
+        if (!end)
+            continue;
+
+        int modlen = (int)(end - bracket);
+        if (modlen <= 0 || modlen >= MODULE_NAME_LEN)
+            continue;
+
+        char modname[MODULE_NAME_LEN];
+        memcpy(modname, bracket, modlen);
+        modname[modlen] = '\0';
+
+        /* 跳过已知模块 */
+        bool is_known = false;
+        for (int i = 0; i < known_n; i++) {
+            if (strcmp(modname, known_mods[i]) == 0) {
+                is_known = true;
+                break;
+            }
+        }
+        if (is_known)
+            continue;
+
+        /* 跳过 modscan 自身 */
+        if (strcmp(modname, "modscan") == 0)
+            continue;
+
+        /* 记录孤儿模块（去重并计数） */
+        bool found = false;
+        for (int i = 0; i < orphan_n; i++) {
+            if (strcmp(orphans[i].name, modname) == 0) {
+                orphans[i].sym_count++;
+                found = true;
+                break;
+            }
+        }
+        if (!found && orphan_n < KSYM_ORPHAN_MAX) {
+            strncpy(orphans[orphan_n].name, modname, MODULE_NAME_LEN - 1);
+            orphans[orphan_n].name[MODULE_NAME_LEN - 1] = '\0';
+            orphans[orphan_n].sym_count = 1;
+            orphan_n++;
+        }
+    }
+    fclose(f);
+
+    if (orphan_n == 0) {
+        ok("  kallsyms 中未发现孤儿模块符号");
+    } else {
+        for (int i = 0; i < orphan_n; i++) {
+            alert("  ORPHAN MODULE: '%s'（%d 个符号残留在 kallsyms，但不在 /proc/modules）",
+                  orphans[i].name, orphans[i].sym_count);
+            FINDING();
+        }
+    }
+}
+
 /* ─── CHECK 3: 内联 patch 与系统调用表劫持 ──────────────────────────────── */
 
 /* x86-64 函数开头的可疑字节序列 */
@@ -623,8 +734,9 @@ int main(void)
     }
 
     /* 执行所有检测 */
-    check_modules_disabled();  printf("\n");
-    check_hidden_modules();    printf("\n");
+    check_modules_disabled();    printf("\n");
+    check_hidden_modules();      printf("\n");
+    check_kallsyms_orphans();    printf("\n");
 
     if (kcore_fd >= 0) {
         check_function_integrity(); printf("\n");

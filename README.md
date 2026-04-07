@@ -162,13 +162,14 @@ kdb> mm <list.next_addr> <value>    # 直接写指针，重新链接模块
 ### 检测能力矩阵
 
 ```
-                      modscan.ko  modscan_scan.sh  modscan_kcore
+                       modscan.ko  modscan_scan.sh  modscan_kcore
 DKOM list_del 隐藏        ✓             ✓               ✓
 modules_disabled=1        N/A           ✓               ✓
 finit_module 内联 patch   N/A           ✓(需python3)    ✓
 系统调用表劫持             N/A           ✓(需python3)    ✓
 LSM hook 插入             N/A           ✗               部分
 /proc/modules 伪造        N/A           ✗               ✓(kcore对比)
+kset 篡改 + 孤儿模块       ✓             ✓               ✓
 ```
 
 ## 注意事项
@@ -176,4 +177,8 @@ LSM hook 插入             N/A           ✗               部分
 - 需要 root 权限（`CAP_SYS_MODULE`）
 - `/proc/modscan` 权限为 0600，只有 root 可读写
 - 在启用了 `CONFIG_RANDSTRUCT`（结构体布局随机化）的内核上，`struct module_kobject` 的字段顺序可能与预期不同，但由于我们使用相同内核头文件编译，`container_of` 偏移量是一致的
-- 本工具仅针对通过 `list_del` 隐藏的模块；同时还修改了 kset 的 rootkit 不在本工具检测范围内
+- 本工具可检测以下类型的 rootkit：
+  - 仅从 `modules` 链表摘除（DKOM `list_del`）
+  - 同时篡改 `modules` 链表和 `module_kset`（通过 kallsyms 孤儿模块检测）
+  - 修改了 kset 但符号仍残留在 kallsyms 中的高级 rootkit
+- 如果 rootkit 同时篡改了所有三个数据结构（`modules` 链表、`module_kset`、kallsyms），则不在本工具检测范围内

@@ -200,19 +200,123 @@ static bool name_in_modules_list(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Kallsyms orphan detection (detects rootkits that also tamper kset) */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Even if a rootkit removes itself from both the modules list AND
+ * the module_kset, its symbols typically remain in kallsyms.
+ * Module symbols appear as:  addr type symbol_name  [module_name]
+ * We walk kallsyms and find module names that are NOT in the modules list.
+ */
+
+#define MODSCAN_ORPHAN_MAX 64
+
+struct modscan_orphan {
+	char name[MODULE_NAME_LEN];
+	int  sym_count;
+};
+
+static int scan_kallsyms_orphans(struct modscan_orphan *orphans, int max)
+{
+	struct modscan_sym {
+		char modname[MODULE_NAME_LEN];
+	} *syms;
+	int n_syms = 0, n_orphans = 0;
+	const int max_syms = 8192;
+	char line[256];
+	struct file *f;
+	loff_t pos = 0;
+	ssize_t n;
+
+	syms = kmalloc_array(max_syms, sizeof(*syms), GFP_KERNEL);
+	if (!syms)
+		return -ENOMEM;
+
+	f = filp_open("/proc/kallsyms", O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		kfree(syms);
+		return PTR_ERR(f);
+	}
+
+	while (n_syms < max_syms) {
+		n = kernel_read(f, line, sizeof(line) - 1, &pos);
+		if (n <= 0)
+			break;
+		line[n] = '\0';
+
+		/* Find the [module_name] suffix */
+		char *bracket = strchr(line, '[');
+		if (!bracket)
+			continue;
+		bracket++;
+
+		char *end = strchr(bracket, ']');
+		if (!end)
+			continue;
+
+		int modlen = (int)(end - bracket);
+		if (modlen <= 0 || modlen >= MODULE_NAME_LEN)
+			continue;
+
+		memcpy(syms[n_syms].modname, bracket, modlen);
+		syms[n_syms].modname[modlen] = '\0';
+		n_syms++;
+	}
+
+	filp_close(f, NULL);
+
+	/* Check each module name against the modules list */
+	for (int i = 0; i < n_syms; i++) {
+		/* Skip built-in kernel symbols and ourselves */
+		if (strcmp(syms[i].modname, THIS_MODULE->name) == 0)
+			continue;
+
+		/* Skip if already in modules list */
+		if (name_in_modules_list(syms[i].modname))
+			continue;
+
+		/* Check if already in orphan list */
+		bool found = false;
+		for (int j = 0; j < n_orphans; j++) {
+			if (strcmp(orphans[j].name, syms[i].modname) == 0) {
+				orphans[j].sym_count++;
+				found = true;
+				break;
+			}
+		}
+		if (!found && n_orphans < max) {
+			strncpy(orphans[n_orphans].name, syms[i].modname,
+				MODULE_NAME_LEN - 1);
+			orphans[n_orphans].name[MODULE_NAME_LEN - 1] = '\0';
+			orphans[n_orphans].sym_count = 1;
+			n_orphans++;
+		}
+	}
+
+	kfree(syms);
+	return n_orphans;
+}
+
+/* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
 
 static int modscan_show(struct seq_file *m, void *v)
 {
 	struct modscan_snap *snap;
-	int i, n = 0, n_hidden = 0;
+	struct modscan_orphan orphans[MODSCAN_ORPHAN_MAX];
+	int i, n = 0, n_hidden = 0, n_orphan = 0;
+
+	seq_puts(m, "=== ModScan: Hidden Module Scan ===\n\n");
+
+	/* ------------------------------------------------------------------ */
+	/* Phase 1: kset vs modules list (DKOM list_del detection)             */
+	/* ------------------------------------------------------------------ */
 
 	snap = snapshot_kset(&n);
 	if (IS_ERR(snap))
 		return PTR_ERR(snap);
-
-	seq_puts(m, "=== ModScan: Hidden Module Scan ===\n\n");
 
 	if (mutex_lock_killable(&module_mutex)) {
 		kfree(snap);
@@ -220,7 +324,6 @@ static int modscan_show(struct seq_file *m, void *v)
 	}
 
 	for (i = 0; i < n; i++) {
-		/* Skip ourselves */
 		if (strcmp(snap[i].name, THIS_MODULE->name) == 0)
 			continue;
 		if (!name_in_modules_list(snap[i].name)) {
@@ -232,10 +335,33 @@ static int modscan_show(struct seq_file *m, void *v)
 	mutex_unlock(&module_mutex);
 	kfree(snap);
 
-	if (n_hidden == 0)
-		seq_puts(m, "(no hidden modules detected)\n");
+	/* ------------------------------------------------------------------ */
+	/* Phase 2: kallsyms orphans (detects rootkits that also tamper kset)  */
+	/* ------------------------------------------------------------------ */
+
+	n_orphan = scan_kallsyms_orphans(orphans, MODSCAN_ORPHAN_MAX);
+	if (n_orphan < 0) {
+		seq_printf(m, "WARNING: kallsyms orphan scan failed (err=%d)\n",
+			   n_orphan);
+	} else if (n_orphan > 0) {
+		seq_puts(m, "\n--- Kallsyms Orphan Modules ---\n");
+		seq_puts(m, "(modules whose symbols remain in kallsyms but are not in /proc/modules)\n");
+		seq_puts(m, "These may be rootkits that tampered with both modules list AND kset.\n\n");
+		for (i = 0; i < n_orphan; i++) {
+			seq_printf(m, "ORPHAN  %s  (%d symbols)\n",
+				   orphans[i].name, orphans[i].sym_count);
+		}
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Summary                                                            */
+	/* ------------------------------------------------------------------ */
+
+	if (n_hidden == 0 && n_orphan <= 0)
+		seq_puts(m, "\n(no hidden modules detected)\n");
 	else
-		seq_printf(m, "\n%d hidden module(s) found.\n", n_hidden);
+		seq_printf(m, "\n%d hidden module(s) found, %d orphan module(s) found.\n",
+			   n_hidden, max(n_orphan, 0));
 
 	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
 	return 0;
