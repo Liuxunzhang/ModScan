@@ -40,6 +40,8 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/percpu.h>
+#include <linux/timer.h>
 #include <linux/vmalloc.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
@@ -751,6 +753,138 @@ static void modscan_raw_scan(struct seq_file *m)
 #endif /* MODULES_VADDR */
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Kernel timer scan — find timers whose callback is in rootkit range */
+/* ------------------------------------------------------------------ */
+
+/*
+ * On kernel 3.10 (RHEL7), timers live in per-CPU tvec_base wheel arrays.
+ * Layout:
+ *   tvec_base { lock(4), pad, running_timer(8), timer_jiffies(8),
+ *               next_timer(8), active_timers(8),
+ *               tv1: TVR_SIZE(256) list_heads,
+ *               tv2..tv5: TVN_SIZE(64) list_heads each }
+ *
+ * Each list_head slot chains struct timer_list entries via their ->entry
+ * field (list_head at offset 0).  The ->function pointer is at offset +24.
+ *
+ * struct timer_list layout (3.10, x86-64):
+ *   +0   entry.next   8B  (list_head)
+ *   +8   entry.prev   8B
+ *   +16  expires      8B  (unsigned long)
+ *   +24  base         8B  (struct tvec_base *)
+ *   +32  function     8B  (void (*)(unsigned long))
+ *   +40  data         8B
+ *   ...
+ *
+ * We walk every slot of every CPU's timer wheel and report any timer
+ * whose ->function falls inside a caller-supplied address range.
+ */
+
+#define TVR_SIZE   256
+#define TVN_SIZE    64
+/* Total list_heads per tvec_base: 256 + 4*64 = 512 */
+#define TVEC_BASE_WHEELS  512
+
+/* Offsets within tvec_base (x86-64, kernel 3.10) */
+#define TVB_LOCK_SZ      4   /* spinlock_t */
+#define TVB_HDR_SZ      40   /* lock(4)+pad(4)+running_timer(8)+jiffies(8)
+                                +next_timer(8)+active_timers(8) */
+#define TVB_VEC_OFF  TVB_HDR_SZ   /* first list_head starts here */
+
+/* Offsets within struct timer_list */
+#define TL_NEXT_OFF   0    /* entry.next */
+#define TL_FUNC_OFF  32    /* function pointer */
+
+static void modscan_timer_scan(struct seq_file *m,
+			       unsigned long range_start,
+			       unsigned long range_end)
+{
+	unsigned long tvec_bases_addr;
+	int cpu, n_found = 0;
+
+	tvec_bases_addr = modscan_kallsyms("tvec_bases");
+	if (!tvec_bases_addr) {
+		seq_puts(m, "  (tvec_bases not in kallsyms"
+			    " — timer scan unavailable)\n");
+		return;
+	}
+	seq_printf(m,
+		   "  Timer scan: looking for callbacks in"
+		   " [0x%lx, 0x%lx]\n\n",
+		   range_start, range_end);
+
+	for_each_possible_cpu(cpu) {
+		unsigned long base_ptr = 0;
+		unsigned long base;
+		int slot;
+
+		/*
+		 * tvec_bases is DEFINE_PER_CPU(struct tvec_base *, tvec_bases).
+		 * kallsyms gives the per-CPU section base offset of the variable.
+		 * CPU N's copy lives at: tvec_bases_addr + __per_cpu_offset[N].
+		 * That address holds a struct tvec_base * — read it.
+		 */
+		{
+			unsigned long pcp_addr = tvec_bases_addr +
+						  __per_cpu_offset[cpu];
+			if (vmscan_read(&base_ptr, (void *)pcp_addr,
+					sizeof(base_ptr)))
+				continue;
+		}
+		if (!vmscan_is_kptr(base_ptr))
+			continue;
+		base = base_ptr;
+
+		for (slot = 0; slot < TVEC_BASE_WHEELS; slot++) {
+			unsigned long head_addr;
+			unsigned long cur;
+			int depth = 0;
+
+			head_addr = base + TVB_VEC_OFF +
+				    slot * 2 * sizeof(unsigned long);
+
+			/* Read head.next */
+			if (vmscan_read(&cur, (void *)head_addr, 8))
+				continue;
+
+			while (cur != head_addr && depth < 4096) {
+				unsigned long fn = 0;
+				unsigned long nxt = 0;
+
+				depth++;
+				/* Read timer->function at cur+32 */
+				if (vmscan_read(&fn,
+						(void *)(cur + TL_FUNC_OFF),
+						8))
+					break;
+				/* Read timer->entry.next at cur+0 */
+				if (vmscan_read(&nxt, (void *)cur, 8))
+					break;
+
+				if (fn >= range_start && fn <= range_end) {
+					seq_printf(m,
+						   "  TIMER  cpu=%d slot=%d"
+						   "  timer_list @ 0x%lx"
+						   "  fn=0x%lx\n",
+						   cpu, slot, cur, fn);
+					n_found++;
+				}
+				cur = nxt;
+			}
+		}
+	}
+
+	if (n_found == 0)
+		seq_puts(m, "  (no timers found in that range)\n");
+	else
+		seq_printf(m,
+			   "  Found %d timer(s).\n"
+			   "  To cancel: echo 'cancel-timer <timer_addr>'"
+			   " > /proc/modscan\n", n_found);
+}
+
 /* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
@@ -943,6 +1077,17 @@ static int modscan_show(struct seq_file *m, void *v)
 	 */
 	seq_puts(m, "\n=== Raw Module Range Scan (Last Resort) ===\n\n");
 	modscan_raw_scan(m);
+
+#ifdef MODULES_VADDR
+	/*
+	 * Timer scan — look for rootkit watchdog timers whose callback
+	 * sits inside the module vmalloc range.  If found, the timer is
+	 * what re-hides the module after each restore-addr call.
+	 * "cancel-timer <addr>" removes the entry from the wheel.
+	 */
+	seq_puts(m, "\n=== Rootkit Timer Scan ===\n\n");
+	modscan_timer_scan(m, MODULES_VADDR, MODULES_END);
+#endif
 
 	return 0;
 }
@@ -1163,12 +1308,50 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	}
 #endif
 
+	/*
+	 * Command: cancel-timer <hex>
+	 *
+	 * Remove a struct timer_list from its timer wheel bucket.
+	 * Use the address printed by "=== Rootkit Timer Scan ===" above.
+	 * After canceling the watchdog timer the rootkit can no longer
+	 * re-hide itself; restore-addr + rmmod --force will then work.
+	 *
+	 * Example:
+	 *   echo 'cancel-timer 0xffffffffc0931000' > /proc/modscan
+	 */
+	if (strncmp(kbuf, "cancel-timer ", 13) == 0) {
+		unsigned long taddr = 0;
+		struct timer_list *tl;
+
+		if (kstrtoul(kbuf + 13, 16, &taddr)) {
+			pr_err("modscan: cancel-timer: bad hex address\n");
+			return -EINVAL;
+		}
+		if (!vmscan_is_kptr(taddr)) {
+			pr_err("modscan: cancel-timer: invalid address\n");
+			return -EINVAL;
+		}
+		tl = (struct timer_list *)taddr;
+		/*
+		 * del_timer_sync() waits for any running instance to
+		 * finish and then removes the timer from the wheel.
+		 * Returns 1 if the timer was pending, 0 if not.
+		 */
+		if (del_timer_sync(tl))
+			pr_info("modscan: timer @ 0x%lx canceled\n", taddr);
+		else
+			pr_info("modscan: timer @ 0x%lx was not pending\n",
+				taddr);
+		return count;
+	}
+
 	if (sscanf(kbuf, "restore %55s", modname) != 1) {
 		pr_err("modscan: unknown command '%s'\n"
 		       "modscan: usage:\n"
 		       "  echo 'restore <name>' > /proc/modscan\n"
 		       "  echo 'restore-addr <hex>' > /proc/modscan\n"
-		       "  echo 'fix-refcnt <hex>' > /proc/modscan\n",
+		       "  echo 'fix-refcnt <hex>' > /proc/modscan\n"
+		       "  echo 'cancel-timer <hex>' > /proc/modscan\n",
 		       kbuf);
 		return -EINVAL;
 	}
