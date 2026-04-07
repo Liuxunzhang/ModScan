@@ -630,6 +630,52 @@ static void modscan_raw_scan(struct seq_file *m)
 					continue;
 			}
 
+			/* ── Filter [6]: mkobj.kobj.name cross-check ────────── *
+			 * struct module layout (stable across x86-64 kernels):
+			 *   +80  mkobj.kobj.name  — const char * pointing to the
+			 *                           module name string in .data
+			 *
+			 * For a real struct module, that pointer dereferences to
+			 * the same string as +24.  For a false positive (random
+			 * data inside another module that passed filters 1-5),
+			 * offset +80 is unlikely to point back to that name.
+			 *
+			 * Skipped for DKOM-poisoned entries: the rootkit may
+			 * also have called kobject_del() which clears kobj->name.
+			 * For those, LIST_POISON evidence is sufficient.
+			 */
+			if (!is_dkom) {
+				unsigned long kn_ptr = 0;
+				char kn_buf[MODULE_NAME_LEN + 1];
+				bool f6_pass = false;
+
+				do {
+					/* kobj.name sits at window-offset +80 */
+					if (off + 88 <= (unsigned int)PAGE_SIZE)
+						memcpy(&kn_ptr,
+						       page_buf + off + 80, 8);
+					else if (vmscan_read(&kn_ptr,
+							     (void *)(addr + off + 80),
+							     8))
+						break;
+
+					if (!vmscan_is_kptr(kn_ptr))
+						break;
+
+					memset(kn_buf, 0, sizeof(kn_buf));
+					if (vmscan_read(kn_buf, (void *)kn_ptr,
+							MODULE_NAME_LEN))
+						break;
+					kn_buf[MODULE_NAME_LEN] = '\0';
+
+					if (strncmp(kn_buf, name, MODULE_NAME_LEN) == 0)
+						f6_pass = true;
+				} while (0);
+
+				if (!f6_pass)
+					continue;
+			}
+
 			/* ── Deduplication: skip if same name already found ── */
 			{
 				int dup = 0, k;
@@ -823,11 +869,94 @@ static int modscan_open(struct inode *inode, struct file *file)
  * The spinlock is released before acquiring the mutex because
  * mutex_lock may sleep, which is forbidden in atomic context.
  */
+/*
+ * modscan_restore_raw() — restore a module whose struct module address was
+ * discovered by the raw memory scan (modscan_raw_scan).
+ *
+ * Used when the rootkit has removed the module from ALL kernel tracking
+ * structures (modules list + kset/sysfs), leaving no linked-list path to
+ * find the struct module *.  The raw scan gives us the virtual address
+ * directly; this function validates it and re-links the module.
+ *
+ * Safety checks before touching anything:
+ *   1. Address in [MODULES_VADDR, MODULES_END), 8-byte aligned
+ *   2. state field valid (0-3)
+ *   3. name field printable ASCII, non-empty
+ *   4. Module is NOT already in the modules list (idempotent)
+ */
+#ifdef MODULES_VADDR
+static ssize_t modscan_restore_raw(unsigned long raw_addr, size_t count)
+{
+	struct module *mod;
+	u32 state = 0xff;
+	char name[MODULE_NAME_LEN + 1] = {};
+	int i, nlen = -1;
+
+	/* [1] Range and alignment */
+	if (raw_addr < MODULES_VADDR || raw_addr >= MODULES_END ||
+	    (raw_addr & 7)) {
+		pr_err("modscan: restore-addr 0x%lx out of range/misaligned\n",
+		       raw_addr);
+		return -ERANGE;
+	}
+
+	/* [2] state */
+	if (vmscan_read(&state, (void *)raw_addr, 4) ||
+	    state > MODULE_STATE_UNFORMED) {
+		pr_err("modscan: restore-addr 0x%lx: invalid state\n", raw_addr);
+		return -EINVAL;
+	}
+
+	/* [3] name */
+	if (vmscan_read(name, (void *)(raw_addr + 24), MODULE_NAME_LEN)) {
+		pr_err("modscan: restore-addr 0x%lx: cannot read name\n",
+		       raw_addr);
+		return -EINVAL;
+	}
+	name[MODULE_NAME_LEN] = '\0';
+	for (i = 0; i < MODULE_NAME_LEN; i++) {
+		if (name[i] == '\0') { nlen = i; break; }
+		if ((unsigned char)name[i] < 0x20 ||
+		    (unsigned char)name[i] >= 0x7f)
+			break;
+	}
+	if (nlen <= 0) {
+		pr_err("modscan: restore-addr 0x%lx: invalid name\n", raw_addr);
+		return -EINVAL;
+	}
+
+	mod = (struct module *)raw_addr;
+
+	/* [4] Re-link under module_mutex */
+	if (mutex_lock_killable(&module_mutex))
+		return -EINTR;
+
+	if (name_in_modules_list(name)) {
+		mutex_unlock(&module_mutex);
+		pr_info("modscan: '%s' is already in the modules list\n", name);
+		return -EEXIST;
+	}
+
+	/*
+	 * Re-insert at the tail of the modules list.
+	 * list_add() overwrites mod->list.next/prev, clearing any LIST_POISON
+	 * values left by the rootkit's list_del() call.
+	 * After this, lsmod and rmmod will find the module again.
+	 */
+	list_add_tail(&mod->list, modules_list_head);
+	mutex_unlock(&module_mutex);
+
+	pr_info("modscan: module '%s' @ 0x%lx restored to modules list\n",
+		name, raw_addr);
+	return count;
+}
+#endif /* MODULES_VADDR */
+
 static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
-	/* "restore " (8) + MODULE_NAME_LEN (56) + NUL */
-	char kbuf[8 + MODULE_NAME_LEN];
+	/* longest command: "restore-addr 0xffffffffffffffff\n" = 32 bytes */
+	char kbuf[64];
 	char modname[MODULE_NAME_LEN];
 	struct kobject        *kobj;
 	struct module_kobject *mkobj;
@@ -843,9 +972,33 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	if (len > 0 && kbuf[len - 1] == '\n')
 		kbuf[--len] = '\0';
 
+	/*
+	 * Command: restore-addr <hex>
+	 *
+	 * Use when the rootkit has also removed the module from module_kset
+	 * (so "restore <name>" cannot find it).  Supply the address printed
+	 * by the Raw Module Range Scan section of /proc/modscan.
+	 *
+	 * Example:
+	 *   echo 'restore-addr 0xffffffffc0931a80' > /proc/modscan
+	 */
+#ifdef MODULES_VADDR
+	if (strncmp(kbuf, "restore-addr ", 13) == 0) {
+		unsigned long raw_addr = 0;
+
+		if (kstrtoul(kbuf + 13, 16, &raw_addr)) {
+			pr_err("modscan: restore-addr: bad hex address\n");
+			return -EINVAL;
+		}
+		return modscan_restore_raw(raw_addr, count);
+	}
+#endif
+
 	if (sscanf(kbuf, "restore %55s", modname) != 1) {
 		pr_err("modscan: unknown command '%s'\n"
-		       "modscan: usage: echo 'restore <name>' > /proc/modscan\n",
+		       "modscan: usage:\n"
+		       "  echo 'restore <name>' > /proc/modscan\n"
+		       "  echo 'restore-addr <hex>' > /proc/modscan\n",
 		       kbuf);
 		return -EINVAL;
 	}
@@ -864,7 +1017,11 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	spin_unlock(&modscan_kset->list_lock);
 
 	if (!target) {
-		pr_err("modscan: '%s' not found in module kset\n", modname);
+		pr_err("modscan: '%s' not found in module kset\n"
+		       "modscan: if the rootkit removed it from kset too, use:\n"
+		       "  echo 'restore-addr <hex>' > /proc/modscan\n"
+		       "  (address from the Raw Module Range Scan output)\n",
+		       modname);
 		return -ENOENT;
 	}
 
