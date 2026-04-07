@@ -7,9 +7,11 @@
 #   1. modules_disabled sysctl（一次性开关，被 rootkit 设置后无法恢复）
 #   2. /sys/module/ vs /proc/modules 一致性（DKOM list_del 攻击）
 #   3. /proc/kallsyms 孤儿模块符号（被隐藏的模块仍有符号残留）
-#   4. finit_module / init_module / load_module 内联 patch 检测（需要 /proc/kcore）
-#   5. 系统调用表指针劫持检测（需要 /proc/kcore）
-#   6. sig_enforce 状态
+#   4. finit_module / init_module / load_module / tcp4_seq_show 等内联 patch 检测（需要 /proc/kcore）
+#   5. 系统调用表指针劫持检测，含 getdents/getdents64（需要 /proc/kcore）
+#   6. kset/sysfs 四维交叉验证（含 stat 绕过 getdents64 hook，检测 Skidmap 文件隐藏）
+#   7. sig_enforce 状态
+#   8. Skidmap 恶意软件特征（已知模块名、ld.so.preload、PAM 后门、cron 持久化）
 #
 # 用法: sudo bash modscan_scan.sh
 #
@@ -125,6 +127,22 @@ check_modules_consistency() {
         ok "  /sys/module/ 和 /proc/modules 一致（未发现 DKOM 隐藏模块）"
     else
         alert "  共发现 $hidden 个 DKOM 隐藏模块"
+    fi
+
+    # 反向检测：/proc/modules 中有，但 stat 访问 sysfs initstate 失败
+    # stat 使用 newfstatat，不经过 getdents64，即使 getdents64 被 hook 也能访问
+    # 如果 stat 失败，说明 sysfs 条目已被删除（kobject_del）
+    local sysfs_missing=0
+    while read -r mname _rest; do
+        if [[ ! -f "/sys/module/${mname}/initstate" ]]; then
+            alert "  SYSFS-MISSING: '$mname' 在 /proc/modules 中，但 /sys/module/${mname}/initstate 不存在"
+            alert "    → 该模块的 sysfs 条目已被删除（kobject_del）或被内核内建模块覆盖"
+            flag
+            sysfs_missing=$(( sysfs_missing + 1 ))
+        fi
+    done < /proc/modules
+    if [[ $sysfs_missing -eq 0 ]]; then
+        ok "  /proc/modules 中所有模块均有对应 sysfs 条目（stat 探测，绕过 getdents64）"
     fi
 }
 
@@ -309,10 +327,16 @@ findings = 0
 # ── CHECK 4: 函数内联 patch 检测 ────────────────────────────────────────────
 print("  [内联 patch 检测]")
 targets = [
-    ('__x64_sys_finit_module', 'finit_module 系统调用入口'),
-    ('__x64_sys_init_module',  'init_module 系统调用入口'),
-    ('load_module',            '核心模块加载函数'),
+    ('__x64_sys_finit_module',         'finit_module 系统调用入口'),
+    ('__x64_sys_init_module',          'init_module 系统调用入口'),
+    ('load_module',                    '核心模块加载函数'),
     ('security_kernel_post_read_file', 'LSM post-read-file hook'),
+    # Skidmap 特征目标：网络连接隐藏 & CPU 使用率伪造
+    ('tcp4_seq_show',  'TCP4 连接列表（Skidmap 隐藏挖矿网络连接）'),
+    ('udp4_seq_show',  'UDP4 连接列表（Skidmap 隐藏挖矿网络连接）'),
+    ('tcp6_seq_show',  'TCP6 连接列表'),
+    ('udp6_seq_show',  'UDP6 连接列表'),
+    ('proc_stat_show', '/proc/stat 输出（Skidmap 伪造 CPU 空闲率）'),
 ]
 
 for (symname, desc) in targets:
@@ -339,10 +363,15 @@ print("\n  [系统调用表指针检测]")
 sct_addr    = sym('sys_call_table')
 finit_addr  = sym('__x64_sys_finit_module')
 init_addr   = sym('__x64_sys_init_module')
+gd_addr     = sym('__x64_sys_getdents')
+gd64_addr   = sym('__x64_sys_getdents64')
 
 SCT_CHECKS = [
-    (313, '__x64_sys_finit_module', finit_addr),  # __NR_finit_module = 313
-    (175, '__x64_sys_init_module',  init_addr),   # __NR_init_module  = 175
+    (313, '__x64_sys_finit_module',  finit_addr),  # __NR_finit_module  = 313
+    (175, '__x64_sys_init_module',   init_addr),   # __NR_init_module   = 175
+    # Skidmap 主要通过劫持这两个调用实现文件隐藏
+    ( 78, '__x64_sys_getdents',      gd_addr),     # __NR_getdents      = 78
+    (217, '__x64_sys_getdents64',    gd64_addr),   # __NR_getdents64    = 217
 ]
 
 if not sct_addr:
@@ -380,10 +409,245 @@ PYEOF
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 6: 模块签名强制检测
+# CHECK 6: kset / sysfs 完整性交叉验证
+#
+# 原理：
+#   通过 /proc/kcore 直接遍历内核内存中的 module_kset->list（比 /sys/module/ 更可信），
+#   与 /sys/module/ 和 /proc/modules 交叉比对，检测三种篡改场景：
+#
+#   A. kcore kset 有 → /sys/module/ 没有：sysfs 条目被单独删除
+#      （rootkit 调用 kernfs_remove() 或 kobject_del()）
+#
+#   B. /sys/module/ 有 → kcore kset 没有：kset 链表被直接篡改
+#      （rootkit 对 kobj->entry 调用 list_del()，sysfs 残留）
+#
+#   C. kcore kset 有 → /proc/modules 和 /sys/module/ 都没有：
+#      高级双重 DKOM，kset 中仍有残留（最隐蔽变种）
+#
+# struct kobject 内存布局（x86-64，Linux 4.x~6.x 稳定）：
+#   offset  0 : const char *name  — 名字字符串指针
+#   offset  8 : list_head entry   — kset 链表节点
+#   offset 48 : kernfs_node *sd   — sysfs 节点指针（NULL = sysfs 已被删除）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+check_kset_sysfs() {
+    info "CHECK 6: module_kset / sysfs / proc 四维完整性交叉验证（via /proc/kcore）"
+
+    if [[ ! -r /proc/kcore ]]; then
+        warn "  /proc/kcore 不可读——跳过 kset/sysfs 交叉验证"
+        return
+    fi
+    if ! command -v python3 &>/dev/null; then
+        warn "  python3 未找到——跳过 kset/sysfs 交叉验证，可使用 modscan_kcore 工具"
+        return
+    fi
+
+    local py_ret=0
+    python3 - <<'PYEOF' || py_ret=$?
+import struct, sys, os
+
+KCORE = "/proc/kcore"
+KSYMS = "/proc/kallsyms"
+
+syms = {}
+try:
+    with open(KSYMS) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                syms[parts[2]] = int(parts[0], 16)
+except PermissionError:
+    print("  [!] /proc/kallsyms 不可读", file=sys.stderr)
+    sys.exit(2)
+
+def sym(name):
+    return syms.get(name, 0)
+
+class KCore:
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.segs = []
+        hdr = self._pread(0, 64)
+        if hdr[:4] != b'\x7fELF':
+            raise ValueError("不是 ELF 文件")
+        e_phoff     = struct.unpack_from('<Q', hdr, 32)[0]
+        e_phentsize = struct.unpack_from('<H', hdr, 54)[0]
+        e_phnum     = struct.unpack_from('<H', hdr, 56)[0]
+        for i in range(e_phnum):
+            ph = self._pread(e_phoff + i * e_phentsize, 56)
+            if struct.unpack_from('<I', ph, 0)[0] != 1:
+                continue
+            self.segs.append((
+                struct.unpack_from('<Q', ph, 16)[0],
+                struct.unpack_from('<Q', ph, 32)[0],
+                struct.unpack_from('<Q', ph, 8)[0],
+            ))
+
+    def _pread(self, offset, n):
+        return os.pread(self.f.fileno(), n, offset)
+
+    def read(self, vaddr, n):
+        for (va, sz, off) in self.segs:
+            if va <= vaddr < va + sz and vaddr + n <= va + sz:
+                d = self._pread(off + (vaddr - va), n)
+                if len(d) == n:
+                    return d
+        return None
+
+    def read_u64(self, vaddr):
+        d = self.read(vaddr, 8)
+        return struct.unpack_from('<Q', d)[0] if d else None
+
+try:
+    kc = KCore(KCORE)
+except Exception as e:
+    print(f"  [!] 无法打开 /proc/kcore: {e}", file=sys.stderr)
+    sys.exit(2)
+
+# ── 遍历 module_kset->list ───────────────────────────────────────────────────
+KOBJ_NAME_OFF  = 0
+KOBJ_ENTRY_OFF = 8
+KOBJ_SD_OFF    = 48
+
+kset_var = sym('module_kset')
+if not kset_var:
+    print("  [-] 'module_kset' 不在 kallsyms（需要 CONFIG_KALLSYMS_ALL=y）")
+    sys.exit(2)
+
+kset_ptr = kc.read_u64(kset_var)
+if not kset_ptr:
+    print("  [!] 无法读取 module_kset 指针")
+    sys.exit(2)
+
+sentinel = kset_ptr
+cur = kc.read_u64(sentinel)
+if cur is None:
+    print("  [!] 无法读取 kset->list.next")
+    sys.exit(2)
+
+kset_names = {}  # name → (kobj_ptr, sd_ptr)
+guard = 0
+while cur != sentinel and guard < 4096:
+    guard += 1
+    kobj = cur - KOBJ_ENTRY_OFF
+    name_ptr = kc.read_u64(kobj + KOBJ_NAME_OFF)
+    if name_ptr:
+        raw = kc.read(name_ptr, 56)
+        if raw:
+            name = raw.split(b'\x00')[0].decode('ascii', errors='replace')
+            if name and all(0x20 <= ord(c) < 0x7f for c in name):
+                sd_ptr = kc.read_u64(kobj + KOBJ_SD_OFF) or 0
+                kset_names[name] = (kobj, sd_ptr)
+    next_ptr = kc.read_u64(cur)
+    if next_ptr is None:
+        break
+    cur = next_ptr
+
+# ── 两种方式枚举 /sys/module/ ─────────────────────────────────────────────────
+#
+# 方式1: scandir / readdir（经过 getdents64/getdents，可能被 rootkit 过滤）
+# 方式2: 对每个 kset 条目逐一 os.path.exists()（使用 newfstatat，不经过 getdents64）
+#
+# Skidmap 等 rootkit hook getdents64 来隐藏目录项，但不 hook newfstatat/stat64。
+# 因此：sysfs_via_stat 能看到 而 sysfs_via_readdir 看不到 → getdents64 被 hook！
+#
+sysfs_via_readdir = set()
+try:
+    for entry in os.scandir('/sys/module'):
+        if entry.is_dir() and os.path.exists(f'/sys/module/{entry.name}/initstate'):
+            sysfs_via_readdir.add(entry.name)
+except Exception as e:
+    print(f"  [!] 无法 scandir /sys/module/: {e}", file=sys.stderr)
+
+proc_mods = set()
+try:
+    with open('/proc/modules') as f:
+        for line in f:
+            proc_mods.add(line.split()[0])
+except Exception as e:
+    print(f"  [!] 无法读取 /proc/modules: {e}", file=sys.stderr)
+
+print(f"    kcore kset 遍历结果          : {len(kset_names)} 个模块 kobject")
+print(f"    /sys/module/ readdir 视图    : {len(sysfs_via_readdir)} 个 LKM（可能被 hook 过滤）")
+print(f"    /proc/modules 视图           : {len(proc_mods)} 个模块\n")
+
+# kset 遍历合理性检查：如果结果远少于 /proc/modules，说明遍历失败（kcore 读取不完整或
+# module_kset 符号不在 kallsyms）；此时 KSET-TAMPER 和 SYSFS-TAMPER 比对不可靠
+kset_walk_valid = len(kset_names) >= max(2, len(proc_mods) // 2)
+if not kset_walk_valid:
+    print(f"  \033[1;33m[!]\033[0m kset 遍历结果 ({len(kset_names)}) 远少于 /proc/modules"
+          f" ({len(proc_mods)})，跳过 KSET-TAMPER 和 SYSFS-TAMPER 比对")
+    print(f"      （可能原因：module_kset 不在 kallsyms 或 kcore 段读取不完整）")
+
+findings = 0
+
+for name, (kobj, sd) in kset_names.items():
+    # 方式2: stat 探测（绕过 getdents64）
+    sysfs_stat_ok = os.path.exists(f'/sys/module/{name}/initstate')
+    in_readdir    = name in sysfs_via_readdir
+    in_proc       = name in proc_mods
+
+    if sysfs_stat_ok and not in_readdir:
+        # ── D: getdents64/getdents 被 hook！—— 这是 Skidmap 的核心隐藏手法 ──
+        extra = ""
+        if not in_proc:
+            extra = "\n            → 且不在 /proc/modules（同时存在 DKOM）"
+        print(f"\033[0;31m    [ALERT]\033[0m GETDENTS-HOOK: '{name}'")
+        print(f"            /sys/module/{name}/initstate 通过 stat() 可访问 ✓")
+        print(f"            但 opendir(/sys/module)+readdir 看不到该目录项 ✗")
+        print(f"            → getdents64/getdents 系统调用被 HOOK，目录遍历结果被过滤！")
+        print(f"            → 这是 Skidmap 等 rootkit 隐藏内核模块目录的核心手段{extra}")
+        print(f"            kobj地址: {kobj:#x}")
+        findings += 1
+
+    elif not sysfs_stat_ok and not in_readdir:
+        # ── A: sysfs 条目已被真正删除 ──
+        # 仅当模块同时在 /proc/modules 中时才报告：kset 条目不在 proc_mods 也不在 sysfs，
+        # 很可能是 kcore 读取产生的垃圾条目（名称指针读错），而非真实的篡改事件
+        if not in_proc:
+            # kset 条目不在 sysfs 也不在 proc_mods → 可能是 kcore walk 的假条目，跳过
+            pass
+        elif kset_walk_valid:
+            print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中，")
+            print(f"            但 stat 和 readdir 均无法访问 /sys/module/{name}/")
+            print(f"            → sysfs 条目已被删除（kernfs_remove / kobject_del）")
+            print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
+            findings += 1
+
+    elif sd == 0 and sysfs_stat_ok:
+        # ── B2: kobject.sd==NULL 但 sysfs 目录仍存在 —— 不一致状态 ──
+        print(f"\033[0;31m    [ALERT]\033[0m SD-NULL: '{name}' kobject.sd==NULL 但 /sys/module/{name}/ 可访问")
+        print(f"            → kernfs 节点指针已被清除，与 sysfs 实际状态不一致")
+        print(f"            kobj地址: {kobj:#x}")
+        findings += 1
+
+# ── C: readdir 看到的但 kcore kset 没有 ─────────────────────────────────────
+# 仅当 kset 遍历结果可信时才进行此比对；若遍历失败（结果过少），跳过以避免误报
+if kset_walk_valid:
+    for name in sysfs_via_readdir:
+        if name not in kset_names:
+            print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 在 readdir 中可见，")
+            print(f"            但不在 kcore kset 链表中！")
+            print(f"            → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留")
+            findings += 1
+
+if findings == 0:
+    print("\033[0;32m    [+]\033[0m 四维一致（kcore kset / stat / readdir / /proc/modules）未发现篡改")
+
+sys.exit(1 if findings > 0 else 0)
+PYEOF
+
+    if [[ $py_ret -eq 1 ]]; then
+        flag
+    elif [[ $py_ret -eq 2 ]]; then
+        warn "  kset/sysfs 交叉验证因错误中止"
+    fi
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHECK 7: 模块签名强制检测
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_sig_enforce() {
-    info "CHECK 6: 模块签名强制 (sig_enforce)"
+    info "CHECK 7: 模块签名强制 (sig_enforce)"
 
     local SIG=/proc/sys/kernel/sig_enforce
     if [[ ! -f "$SIG" ]]; then
@@ -398,6 +662,138 @@ check_sig_enforce() {
         warn "  如果无法加载检测工具，需确认签名配置（或使用 modscan_kcore 无模块检测）"
     else
         ok "  sig_enforce=0（不强制签名）"
+    fi
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHECK 8: Skidmap 恶意软件特征检测
+#
+# Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，通过内核模块实现：
+#   - 劫持 getdents64 隐藏挖矿相关文件（CHECK 4+5 已检测）
+#   - 劫持 tcp4_seq_show 隐藏挖矿网络连接（CHECK 4+5 已检测）
+#   - 使用已知伪装模块名（iproute、netlink、mstf 等）
+#   - 替换 pam_unix.so 实现免密码登录后门
+#   - 写入 /etc/ld.so.preload 实现用户态文件隐藏
+#   - 在 cron 中写入持久化脚本
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+check_skidmap() {
+    info "CHECK 8: Skidmap 恶意软件特征检测"
+
+    # ── 7-1. 已知 Skidmap 内核模块名扫描 ─────────────────────────────────────
+    info "  [8-1] 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）"
+    # 模块名来源：Trend Micro、AT&T Alien Labs 等公开样本分析报告
+    local -a SKIDMAP_MODS=(iproute netlink mstf bcmap kaudited kbuild pc_keyb snd_floppy)
+    local skid_mod_found=0
+
+    if [[ -r /proc/kallsyms ]]; then
+        # 构建 /proc/modules 中的已知模块集合（复用 CHECK 2 的逻辑）
+        declare -A _proc_mods
+        while read -r name _rest; do
+            _proc_mods["$name"]=1
+        done < /proc/modules
+
+        # 从 kallsyms 提取所有 [modname] 字段，检查是否匹配 Skidmap 已知名
+        local found_names
+        found_names=$(awk '
+            NF >= 4 && $4 ~ /^\[.+\]$/ {
+                modname = substr($4, 2, length($4) - 2)
+                seen[modname] = 1
+            }
+            END { for (m in seen) print m }
+        ' /proc/kallsyms)
+
+        for mname in $found_names; do
+            for skid in "${SKIDMAP_MODS[@]}"; do
+                if [[ "$mname" == "$skid" ]]; then
+                    skid_mod_found=$(( skid_mod_found + 1 ))
+                    if [[ -z "${_proc_mods[$mname]+_}" ]]; then
+                        alert "  SKIDMAP 已知模块 '$mname': 符号在 kallsyms 中但不在 /proc/modules（已 DKOM 隐藏）"
+                    else
+                        alert "  SKIDMAP 已知模块 '$mname': 当前已加载（在 /proc/modules 中）"
+                    fi
+                    flag
+                fi
+            done
+        done
+    else
+        warn "  /proc/kallsyms 不可读，跳过已知模块名扫描"
+    fi
+
+    if [[ $skid_mod_found -eq 0 ]]; then
+        ok "  未发现已知 Skidmap 模块名"
+    fi
+
+    # ── 7-2. /etc/ld.so.preload 检测 ─────────────────────────────────────────
+    info "  [8-2] /etc/ld.so.preload 检测（用户态文件隐藏后门）"
+    # 部分 Skidmap 变种通过此文件预加载恶意共享库，实现用户态文件/进程隐藏
+    if [[ -f /etc/ld.so.preload ]]; then
+        if [[ ! -s /etc/ld.so.preload ]]; then
+            warn "  /etc/ld.so.preload 存在但为空（可疑，正常系统通常不存在此文件）"
+        else
+            alert "  /etc/ld.so.preload 存在且非空！内容如下："
+            while IFS= read -r line; do
+                alert "    → $line"
+            done < /etc/ld.so.preload
+            flag
+        fi
+    else
+        ok "  /etc/ld.so.preload 不存在（正常）"
+    fi
+
+    # ── 7-3. PAM 后门检测 ────────────────────────────────────────────────────
+    info "  [8-3] PAM 后门检测（pam_unix.so 完整性）"
+    # Skidmap 将 pam_unix.so 替换为恶意版本，使其接受任意密码
+    # 恶意版体积通常远小于正常版（<50KB vs >80KB）
+    local pam_file=""
+    for p in /lib/security/pam_unix.so \
+              /lib64/security/pam_unix.so \
+              /lib/x86_64-linux-gnu/security/pam_unix.so \
+              /usr/lib/x86_64-linux-gnu/security/pam_unix.so \
+              /usr/lib/security/pam_unix.so; do
+        [[ -f "$p" ]] && pam_file="$p" && break
+    done
+
+    if [[ -z "$pam_file" ]]; then
+        warn "  未找到 pam_unix.so（非标准安装路径或未安装 PAM？）"
+    else
+        local pam_size
+        pam_size=$(stat -c '%s' "$pam_file" 2>/dev/null || echo 0)
+        local pam_mtime_sec
+        pam_mtime_sec=$(stat -c '%Y' "$pam_file" 2>/dev/null || echo 0)
+        local now_sec
+        now_sec=$(date +%s)
+        local age_hours=$(( (now_sec - pam_mtime_sec) / 3600 ))
+
+        if (( pam_size > 0 && pam_size < 51200 )); then
+            alert "  PAM: $pam_file 大小异常小（${pam_size} 字节 < 50KB）— 疑似被 Skidmap 替换！"
+            flag
+        elif (( age_hours < 48 )); then
+            warn "  PAM: $pam_file 在 ${age_hours} 小时前被修改 — 请确认是否为正常系统更新"
+        else
+            ok "  PAM: $pam_file 大小=${pam_size}B  修改于 ${age_hours}h 前（正常）"
+        fi
+    fi
+
+    # ── 7-4. Skidmap cron 持久化检测 ─────────────────────────────────────────
+    info "  [8-4] Skidmap cron 持久化检测"
+    # Skidmap 在 /etc/cron.d/ 中写入使用其伪装模块名命名的 cron 文件
+    local -a SKIDMAP_CRON_FILES=(
+        /etc/cron.d/iproute
+        /etc/cron.d/netlink
+        /etc/cron.d/kbuild
+        /etc/cron.d/mstf
+        /etc/cron.d/bcmap
+    )
+    local cron_found=0
+    for cf in "${SKIDMAP_CRON_FILES[@]}"; do
+        if [[ -f "$cf" ]]; then
+            alert "  CRON: 发现 Skidmap 特征 cron 文件: $cf"
+            flag
+            cron_found=$(( cron_found + 1 ))
+        fi
+    done
+    if [[ $cron_found -eq 0 ]]; then
+        ok "  未发现 Skidmap 特征 cron 文件"
     fi
 }
 
@@ -418,7 +814,11 @@ check_kallsyms_orphans
 echo
 check_hooks_via_kcore
 echo
+check_kset_sysfs
+echo
 check_sig_enforce
+echo
+check_skidmap
 
 echo
 printf "${BLU}────────────────────────────────────────────${RST}\n"

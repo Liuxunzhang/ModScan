@@ -29,6 +29,7 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kernfs.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -39,6 +40,9 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/percpu.h>
+#include <linux/timer.h>
+#include <linux/vmalloc.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
 # define MODSCAN_KPROBE_KALLSYMS 1
@@ -136,7 +140,8 @@ static int __init resolve_symbols(void)
 #define MODSCAN_MAX_SNAP 512
 
 struct modscan_snap {
-	char name[MODULE_NAME_LEN];
+	char            name[MODULE_NAME_LEN];
+	struct kobject *kobj;   /* pointer to the module's kobject in kset */
 };
 
 /*
@@ -176,6 +181,7 @@ static struct modscan_snap *snapshot_kset(int *out_n)
 
 		strncpy(snap[n].name, mkobj->mod->name, MODULE_NAME_LEN - 1);
 		snap[n].name[MODULE_NAME_LEN - 1] = '\0';
+		snap[n].kobj = kobj;
 		n++;
 	}
 	spin_unlock(&modscan_kset->list_lock);
@@ -200,13 +206,693 @@ static bool name_in_modules_list(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/*  vmap_area_list scan — Volatility 3 method, executed in kernel space */
+/* ------------------------------------------------------------------ */
+
+/*
+ * MODULE_STATE_UNFORMED was added in kernel 3.14.
+ * On older kernels (e.g. 3.10/RHEL7) only LIVE/COMING/GOING (0-2) exist.
+ * Defining it here allows the same state check (state > MODULE_STATE_UNFORMED)
+ * to compile and work on both old and new kernels.
+ */
+#ifndef MODULE_STATE_UNFORMED
+# define MODULE_STATE_UNFORMED 3
+#endif
+
+/*
+ * struct vmap_area layout (x86-64) differs by kernel version:
+ *
+ * Linux < 5.7  (flags field before rb_node):
+ *   +0   va_start   8B
+ *   +8   va_end     8B
+ *   +16  flags      8B  ← extra unsigned long
+ *   +24  rb_node   24B  (3 × 8B pointer)
+ *   +48  list.next  8B  ← VA_LIST_OFF = 48
+ *   +56  list.prev  8B
+ *   +64  llist_node 8B  (purge_list.next)
+ *   +72  vm         8B  ← VA_VM_OFF   = 72
+ *
+ * Linux >= 5.7 (no separate flags, vm in union after list):
+ *   +0   va_start   8B
+ *   +8   va_end     8B
+ *   +16  rb_node   24B
+ *   +40  list.next  8B  ← VA_LIST_OFF = 40
+ *   +48  list.prev  8B
+ *   +56  vm (union) 8B  ← VA_VM_OFF   = 56
+ *   +64  flags      8B
+ *
+ * To convert a list.next pointer to the struct start:
+ *   vmap_area* = list_next_ptr - VA_LIST_OFF
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+# define VA_LIST_OFF  40UL
+# define VA_VM_OFF    56UL
+#else
+# define VA_LIST_OFF  48UL
+# define VA_VM_OFF    72UL
+#endif
+
+/* vm_struct layout (stable across versions, only need addr@+8 and flags@+24) */
+#define VM_STRUCT_ADDR_OFF   8UL
+#define VM_STRUCT_FLAGS_OFF  24UL
+
+/* safe kernel read: handles unmapped/faulting addresses without crashing */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+# define vmscan_read(dst, src, n)  copy_from_kernel_nofault((dst), (src), (n))
+#else
+# define vmscan_read(dst, src, n)  probe_kernel_read((dst), (src), (n))
+#endif
+
+static inline bool vmscan_is_kptr(unsigned long p)
+{
+	return p != 0 && (p & 7) == 0 && p >= 0xffff000000000000UL;
+}
+
+/*
+ * modscan_vmap_scan() - walk vmap_area_list from kernel space and scan
+ * every VM_ALLOC region for a struct module signature.
+ *
+ * MUST be called with module_mutex held (calls name_in_modules_list).
+ *
+ * This is the exact equivalent of Volatility 3's linux.hidden_modules
+ * plugin, but running live in kernel space:
+ *   - Reads vmap_area_list directly (not via /proc/vmallocinfo)
+ *   - Dereferences vm_struct to validate VM_ALLOC flag and addr match
+ *   - Checks struct module signature fields in the mapped memory
+ *   - Reports modules whose name is absent from the modules linked list
+ */
+static void modscan_vmap_scan(struct seq_file *m)
+{
+	unsigned long vmal_head, cur;
+	int scanned = 0, vm_cnt = 0, candidates = 0, n_hidden = 0;
+
+	vmal_head = modscan_kallsyms("vmap_area_list");
+	if (!vmal_head) {
+		seq_puts(m, "  (vmap_area_list not in kallsyms"
+			      " — need CONFIG_KALLSYMS_ALL=y)\n");
+		return;
+	}
+	seq_printf(m, "  vmap_area_list @ 0x%lx  "
+		       "(layout: kernel %s 5.7, list_off=%lu vm_off=%lu)\n\n",
+		   vmal_head,
+		   LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0) ? ">=" : "<",
+		   VA_LIST_OFF, VA_VM_OFF);
+
+	/* Read the sentinel head's first .next pointer */
+	if (vmscan_read(&cur, (void *)vmal_head, sizeof(cur)) ||
+	    !vmscan_is_kptr(cur)) {
+		seq_puts(m, "  Cannot read vmap_area_list.next\n");
+		return;
+	}
+
+	while (cur != vmal_head && scanned < 300000) {
+		unsigned long va_base    = cur - VA_LIST_OFF;
+		unsigned long va_start   = 0, va_end   = 0;
+		unsigned long vm_ptr     = 0, list_next = 0;
+		scanned++;
+
+		/* Read the four fields we care about from the vmap_area */
+		if (vmscan_read(&va_start,  (void *)(va_base + 0),          8) ||
+		    vmscan_read(&va_end,    (void *)(va_base + 8),          8) ||
+		    vmscan_read(&list_next, (void *)(va_base + VA_LIST_OFF), 8) ||
+		    vmscan_read(&vm_ptr,    (void *)(va_base + VA_VM_OFF),   8))
+			break;   /* kcore/page gone — stop traversal */
+
+		/* Advance cur before any continue so we never stall */
+		cur = list_next;
+		if (!vmscan_is_kptr(cur))
+			break;
+
+		/* Skip free/lazy-purge areas (vm pointer is NULL or size value) */
+		if (!vmscan_is_kptr(vm_ptr))
+			continue;
+
+		unsigned long va_size;
+		va_size = va_end - va_start;
+		if (va_size < 80 || va_size > 256UL * 1024 * 1024)
+			continue;
+
+		/*
+		 * Validate via vm_struct:
+		 *   vm->addr  (offset +8)  must equal va_start
+		 *   vm->flags (offset +24) must have VM_ALLOC set
+		 */
+		unsigned long vm_addr_v = 0;
+		unsigned long vm_flags_v = 0;
+		if (vmscan_read(&vm_addr_v,  (void *)(vm_ptr + VM_STRUCT_ADDR_OFF),  8) ||
+		    vmscan_read(&vm_flags_v, (void *)(vm_ptr + VM_STRUCT_FLAGS_OFF), 8))
+			continue;
+		if (vm_addr_v != va_start)
+			continue;
+		if (!(vm_flags_v & VM_ALLOC))
+			continue;
+
+		vm_cnt++;
+
+		/*
+		 * struct module signature check (x86-64, stable layout):
+		 *   +0   state     u32  : must be 0–3
+		 *   +8   list.next u64  : valid kernel pointer, 8B-aligned
+		 *   +16  list.prev u64  : same
+		 *   +24  name[56]       : printable ASCII, NUL-terminated
+		 */
+		u32 state;
+		unsigned long mod_lnext;
+		unsigned long mod_lprev;
+		char name[MODULE_NAME_LEN + 1];
+		state = 0xff;
+		mod_lnext = 0; mod_lprev = 0;
+		memset(name, 0, sizeof(name));
+
+		if (vmscan_read(&state,     (void *)(va_start + 0),  4) ||
+		    vmscan_read(&mod_lnext, (void *)(va_start + 8),  8) ||
+		    vmscan_read(&mod_lprev, (void *)(va_start + 16), 8) ||
+		    vmscan_read(name,       (void *)(va_start + 24), MODULE_NAME_LEN))
+			continue;
+
+		if (state > MODULE_STATE_UNFORMED)
+			continue;
+		if (!vmscan_is_kptr(mod_lnext) || !vmscan_is_kptr(mod_lprev))
+			continue;
+
+		/* Name validation: printable ASCII, non-empty, NUL-terminated */
+		name[MODULE_NAME_LEN] = '\0';
+		{
+			char c0 = name[0];
+			if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') ||
+			      (c0 >= '0' && c0 <= '9') || c0 == '_'))
+				continue;
+		}
+		{
+			int i, nlen = -1;
+			for (i = 0; i < MODULE_NAME_LEN; i++) {
+				if (name[i] == '\0') { nlen = i; break; }
+				if ((unsigned char)name[i] < 0x20 ||
+				    (unsigned char)name[i] >= 0x7f)
+					break;
+			}
+			if (nlen <= 0)
+				continue;
+		}
+
+		/* Chain cross-check: list.next - 8 should also have valid state */
+		{
+			u32 next_state = 0xff;
+			if (vmscan_read(&next_state,
+					(void *)(mod_lnext - 8), 4) ||
+			    next_state > MODULE_STATE_UNFORMED)
+				continue;
+		}
+
+		candidates++;
+
+		/* Compare against the live modules list (held under module_mutex) */
+		if (!name_in_modules_list(name)) {
+			seq_printf(m,
+				   "VMAP-HIDDEN  %-20s  @ 0x%lx"
+				   "  size=%-8lu  state=%u\n",
+				   name, va_start, va_size, state);
+			n_hidden++;
+		}
+	}
+
+	seq_printf(m,
+		   "  Scanned: %d vmap_areas | VM_ALLOC: %d"
+		   " | module candidates: %d | hidden: %d\n",
+		   scanned, vm_cnt, candidates, n_hidden);
+	if (n_hidden == 0)
+		seq_puts(m, "  (no hidden modules found by vmap_area scan)\n");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Raw module range scan — Volatility 3 equivalent for live kernels   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * On kernel 3.10 (RHEL7), a sophisticated rootkit can hide itself by
+ * cleaning up ALL kernel tracking structures:
+ *   - list_del()   from the modules linked list
+ *   - kobject_del() from module_kset (sysfs)
+ *   - clearing     vmap_area.vm pointer (or removing from vmap_area_list)
+ *
+ * After this, NO linked-list-based scanner can find the module.
+ * Volatility 3 finds it by scanning a raw memory dump for struct module
+ * signatures. This function is the live-kernel equivalent:
+ *
+ *   Scan every page in [MODULES_VADDR, MODULES_END] with
+ *   probe_kernel_read() / copy_from_kernel_nofault().
+ *   The hidden module's code/data is still mapped (it's still running),
+ *   so the reads succeed and the struct module signature is visible.
+ *
+ * This does NOT rely on:
+ *   modules list, module_kset, vmap_area_list, /proc/modules,
+ *   /sys/module/, /proc/vmallocinfo — all of which can be tampered.
+ *
+ * MODULES_VADDR / MODULES_END on x86-64:
+ *   kernel 3.10-6.x:  0xffffffffa0000000 – 0xfffffffffff00000
+ *   (~1.5 GB range, ~390K pages; ~80-400 ms scan with nofault probing)
+ *
+ * WHY THE PREVIOUS VERSION ONLY FOUND 13 OF 106 MODULES:
+ *
+ *   struct module is NOT at offset 0 of its vmalloc allocation.
+ *   It lives inside the .data section (.gnu.linkonce.this_module),
+ *   which comes after .text and .rodata in the allocation layout:
+ *
+ *     [vmalloc base]  .text  .rodata  .data←struct module  .bss
+ *
+ *   Reading only the first 80 bytes of each page misses every module
+ *   whose struct is at a non-zero page-relative offset.
+ *
+ * FIX — sliding window within each mapped page:
+ *
+ *   1. Read the entire page (4096 B) with one vmscan_read call.
+ *      Unmapped pages fail instantly (-EFAULT); mapped pages are cheap.
+ *   2. Slide an 80-byte window at 8-byte steps across the page.
+ *      (struct module is always at least 8-byte aligned.)
+ *   3. Apply the 5-stage filter at each window position.
+ *
+ *   This catches struct module at any 8B-aligned offset within any
+ *   mapped page — exactly what Volatility 3 does on a raw memory dump.
+ *
+ * Performance (390 K pages, ~1 K mapped):
+ *   Unmapped: 390 K × ~300 ns = ~120 ms  (one fast fault per page)
+ *   Mapped:   1 K × [(4 KB read) + 501 windows × fast filter] ≈ 10 ms
+ *   Total: < 200 ms
+ */
+
+/* Candidate found during phase-1 scan (before mutex is acquired) */
+#define MODSCAN_MAX_CANDS 512
+
+/*
+ * LIST_POISON1/2 are set by list_del() in the deleted entry's own next/prev
+ * fields.  On x86-64: POISON_POINTER_DELTA = 0xdead000000000000
+ *   LIST_POISON1 = 0xdead000000000100
+ *   LIST_POISON2 = 0xdead000000000200
+ * These fail vmscan_is_kptr() (< 0xffff...) but are a definitive indicator
+ * of a module that was removed via list_del() — i.e. DKOM-hidden.
+ * Accept them explicitly so we don't filter out DKOM victims.
+ */
+#define MODSCAN_POISON1  0xdead000000000100UL
+#define MODSCAN_POISON2  0xdead000000000200UL
+
+static inline bool vmscan_is_poison(unsigned long p)
+{
+	return p == MODSCAN_POISON1 || p == MODSCAN_POISON2;
+}
+
+struct modscan_cand {
+	unsigned long addr;   /* exact virtual address of struct module */
+	u32           state;
+	u8            dkom_poisoned; /* list pointers were LIST_POISON — DKOM */
+	char          name[MODULE_NAME_LEN + 1];
+};
+
+static void modscan_raw_scan(struct seq_file *m)
+{
+	struct modscan_cand *cands;
+	u8                  *page_buf;
+	int  ncands = 0, n_visible = 0, hidden = 0, mapped_pages = 0;
+	unsigned long addr;
+
+#ifndef MODULES_VADDR
+	seq_puts(m, "  (MODULES_VADDR not defined — x86-64 only)\n");
+	return;
+#else
+	const unsigned long raw_start = MODULES_VADDR;
+	const unsigned long raw_end   = MODULES_END;
+
+	seq_printf(m,
+		   "  Raw scan (sliding window): 0x%lx – 0x%lx  (%lu pages)\n\n",
+		   raw_start, raw_end,
+		   (raw_end - raw_start) >> PAGE_SHIFT);
+
+	cands = kmalloc_array(MODSCAN_MAX_CANDS, sizeof(*cands), GFP_KERNEL);
+	if (!cands) {
+		seq_puts(m, "  OOM — cands\n");
+		return;
+	}
+
+	/*
+	 * Allocate one page buffer on the heap (4 KB on kernel stack is too
+	 * risky — default stack is 8–16 KB and we have call-chain depth here).
+	 */
+	page_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!page_buf) {
+		seq_puts(m, "  OOM — page_buf\n");
+		kfree(cands);
+		return;
+	}
+
+	/* ── Phase 1: raw page scan, no lock ─────────────────────────────── */
+	for (addr = raw_start;
+	     addr < raw_end && ncands < MODSCAN_MAX_CANDS;
+	     addr += PAGE_SIZE) {
+
+		unsigned int off;
+
+		/*
+		 * Read the entire page at once.
+		 * Unmapped pages fault immediately — cheap.
+		 * Mapped pages give us 4096 bytes to slide over.
+		 */
+		if (vmscan_read(page_buf, (void *)addr, PAGE_SIZE))
+			continue;
+
+		mapped_pages++;
+
+		/*
+		 * Slide an 80-byte window at 8-byte steps.
+		 * 80 bytes covers: state(4)+pad(4)+list.next(8)+list.prev(8)+name(56).
+		 * The window must fit entirely within the page.
+		 */
+		for (off = 0; off + 80 <= (unsigned int)PAGE_SIZE; off += 8) {
+
+			u32           state;
+			unsigned long lnext, lprev;
+			char          name[MODULE_NAME_LEN + 1];
+			int           i, nlen;
+			char          c0;
+			bool          is_dkom;
+
+			/* ── Filter [1]: state ∈ {0,1,2,3} ────────────────── */
+			memcpy(&state, page_buf + off + 0, 4);
+			if (state > MODULE_STATE_UNFORMED)
+				continue;
+
+			/* ── Filter [2]: name[0] is alphanumeric/_ ─────────── *
+			 * Cheap early exit — avoids pointer reads for most windows.
+			 */
+			c0 = (char)page_buf[off + 24];
+			if (!((c0 >= 'a' && c0 <= 'z') ||
+			      (c0 >= 'A' && c0 <= 'Z') ||
+			      (c0 >= '0' && c0 <= '9') || c0 == '_'))
+				continue;
+
+			/* ── Filter [3]: list.next / list.prev ─────────────── *
+			 * Accept either:
+			 *   (a) canonical kernel pointer — module still in list,
+			 *   (b) LIST_POISON1/2 — module removed via list_del().
+			 * LIST_POISON is 0xdead000000000100/200: fails vmscan_is_kptr
+			 * (< 0xffff...) but is definitive evidence of DKOM hiding.
+			 * Any other value (NULL, arbitrary garbage) is rejected.
+			 */
+			memcpy(&lnext, page_buf + off + 8,  8);
+			memcpy(&lprev, page_buf + off + 16, 8);
+			if (!vmscan_is_kptr(lnext) && !vmscan_is_poison(lnext))
+				continue;
+			if (!vmscan_is_kptr(lprev) && !vmscan_is_poison(lprev))
+				continue;
+
+			/* True when list_del() poisoned the module's list ptrs */
+			is_dkom = vmscan_is_poison(lnext) || vmscan_is_poison(lprev);
+
+			/* ── Filter [4]: full name validation ──────────────── */
+			memcpy(name, page_buf + off + 24, MODULE_NAME_LEN);
+			name[MODULE_NAME_LEN] = '\0';
+			nlen = -1;
+			for (i = 0; i < MODULE_NAME_LEN; i++) {
+				if (name[i] == '\0') { nlen = i; break; }
+				if ((unsigned char)name[i] < 0x20 ||
+				    (unsigned char)name[i] >= 0x7f)
+					break;
+			}
+			if (nlen <= 0)
+				continue;
+
+			/* ── Filter [5]: chain cross-check ─────────────────── *
+			 * For live-list modules: walk to the neighbour struct
+			 * and verify its state — catches false positives from
+			 * data that happens to look like a module header.
+			 *
+			 * For DKOM-poisoned modules: skip — reading from POISON
+			 * addresses would fault.  The POISON values ARE the proof.
+			 */
+			if (!is_dkom) {
+				u32 ns = 0xff, ps = 0xff;
+
+				if (vmscan_read(&ns, (void *)(lnext - 8), 4) ||
+				    ns > MODULE_STATE_UNFORMED)
+					continue;
+				if (vmscan_read(&ps, (void *)(lprev - 8), 4) ||
+				    ps > MODULE_STATE_UNFORMED)
+					continue;
+			}
+
+			/* ── Filter [6]: mkobj.kobj.name cross-check ────────── *
+			 * struct module layout (stable across x86-64 kernels):
+			 *   +80  mkobj.kobj.name  — const char * pointing to the
+			 *                           module name string in .data
+			 *
+			 * For a real struct module, that pointer dereferences to
+			 * the same string as +24.  For a false positive (random
+			 * data inside another module that passed filters 1-5),
+			 * offset +80 is unlikely to point back to that name.
+			 *
+			 * Skipped for DKOM-poisoned entries: the rootkit may
+			 * also have called kobject_del() which clears kobj->name.
+			 * For those, LIST_POISON evidence is sufficient.
+			 */
+			if (!is_dkom) {
+				unsigned long kn_ptr = 0;
+				char kn_buf[MODULE_NAME_LEN + 1];
+				bool f6_pass = false;
+
+				do {
+					/* kobj.name sits at window-offset +80 */
+					if (off + 88 <= (unsigned int)PAGE_SIZE)
+						memcpy(&kn_ptr,
+						       page_buf + off + 80, 8);
+					else if (vmscan_read(&kn_ptr,
+							     (void *)(addr + off + 80),
+							     8))
+						break;
+
+					if (!vmscan_is_kptr(kn_ptr))
+						break;
+
+					memset(kn_buf, 0, sizeof(kn_buf));
+					if (vmscan_read(kn_buf, (void *)kn_ptr,
+							MODULE_NAME_LEN))
+						break;
+					kn_buf[MODULE_NAME_LEN] = '\0';
+
+					if (strncmp(kn_buf, name, MODULE_NAME_LEN) == 0)
+						f6_pass = true;
+				} while (0);
+
+				if (!f6_pass)
+					continue;
+			}
+
+			/* ── Deduplication: skip if same name already found ── */
+			{
+				int dup = 0, k;
+
+				for (k = 0; k < ncands; k++) {
+					if (strncmp(cands[k].name, name,
+						    MODULE_NAME_LEN) == 0) {
+						dup = 1;
+						break;
+					}
+				}
+				if (dup)
+					continue;
+			}
+
+			/* ── Record candidate ───────────────────────────────── */
+			if (ncands < MODSCAN_MAX_CANDS) {
+				cands[ncands].addr         = addr + off;
+				cands[ncands].state        = state;
+				cands[ncands].dkom_poisoned = is_dkom ? 1 : 0;
+				memcpy(cands[ncands].name, name,
+				       MODULE_NAME_LEN + 1);
+				ncands++;
+			}
+		}
+	}
+
+	kfree(page_buf);
+
+	/* ── Phase 2: compare against modules list (brief mutex hold) ─────── */
+	if (ncands > 0) {
+		if (mutex_lock_killable(&module_mutex) == 0) {
+			int i;
+			for (i = 0; i < ncands; i++) {
+				if (name_in_modules_list(cands[i].name)) {
+					n_visible++;
+				} else {
+					seq_printf(m,
+						   "RAW-HIDDEN   %-20s"
+						   "  @ 0x%lx  state=%u%s\n",
+						   cands[i].name,
+						   cands[i].addr,
+						   cands[i].state,
+						   cands[i].dkom_poisoned
+						   ? "  [LIST_POISON -- DKOM via list_del]"
+						   : "");
+					hidden++;
+				}
+			}
+			mutex_unlock(&module_mutex);
+		} else {
+			seq_puts(m, "  (interrupted — module_mutex unavailable)\n");
+		}
+	}
+
+	kfree(cands);
+
+	seq_printf(m,
+		   "  Mapped pages: %d | Signatures found: %d"
+		   " (%d visible, %d HIDDEN)\n",
+		   mapped_pages, ncands, n_visible, hidden);
+	if (mapped_pages == 0)
+		seq_puts(m, "  NOTE: No mapped pages — rebuild modscan.ko for"
+			    " this kernel version\n");
+	else if (hidden == 0 && ncands > 0)
+		seq_puts(m, "  (all found modules are in the modules list)\n");
+#endif /* MODULES_VADDR */
+}
+
+
+/* ------------------------------------------------------------------ */
+/*  Kernel timer scan — find timers whose callback is in rootkit range */
+/* ------------------------------------------------------------------ */
+
+/*
+ * On kernel 3.10 (RHEL7), timers live in per-CPU tvec_base wheel arrays.
+ * Layout:
+ *   tvec_base { lock(4), pad, running_timer(8), timer_jiffies(8),
+ *               next_timer(8), active_timers(8),
+ *               tv1: TVR_SIZE(256) list_heads,
+ *               tv2..tv5: TVN_SIZE(64) list_heads each }
+ *
+ * Each list_head slot chains struct timer_list entries via their ->entry
+ * field (list_head at offset 0).  The ->function pointer is at offset +24.
+ *
+ * struct timer_list layout (3.10, x86-64):
+ *   +0   entry.next   8B  (list_head)
+ *   +8   entry.prev   8B
+ *   +16  expires      8B  (unsigned long)
+ *   +24  base         8B  (struct tvec_base *)
+ *   +32  function     8B  (void (*)(unsigned long))
+ *   +40  data         8B
+ *   ...
+ *
+ * We walk every slot of every CPU's timer wheel and report any timer
+ * whose ->function falls inside a caller-supplied address range.
+ */
+
+#define TVR_SIZE   256
+#define TVN_SIZE    64
+/* Total list_heads per tvec_base: 256 + 4*64 = 512 */
+#define TVEC_BASE_WHEELS  512
+
+/* Offsets within tvec_base (x86-64, kernel 3.10) */
+#define TVB_LOCK_SZ      4   /* spinlock_t */
+#define TVB_HDR_SZ      40   /* lock(4)+pad(4)+running_timer(8)+jiffies(8)
+                                +next_timer(8)+active_timers(8) */
+#define TVB_VEC_OFF  TVB_HDR_SZ   /* first list_head starts here */
+
+/* Offsets within struct timer_list */
+#define TL_NEXT_OFF   0    /* entry.next */
+#define TL_FUNC_OFF  32    /* function pointer */
+
+static void modscan_timer_scan(struct seq_file *m,
+			       unsigned long range_start,
+			       unsigned long range_end)
+{
+	unsigned long tvec_bases_addr;
+	int cpu, n_found = 0;
+
+	tvec_bases_addr = modscan_kallsyms("tvec_bases");
+	if (!tvec_bases_addr) {
+		seq_puts(m, "  (tvec_bases not in kallsyms"
+			    " — timer scan unavailable)\n");
+		return;
+	}
+	seq_printf(m,
+		   "  Timer scan: looking for callbacks in"
+		   " [0x%lx, 0x%lx]\n\n",
+		   range_start, range_end);
+
+	for_each_possible_cpu(cpu) {
+		unsigned long base_ptr = 0;
+		unsigned long base;
+		int slot;
+
+		/*
+		 * tvec_bases is DEFINE_PER_CPU(struct tvec_base *, tvec_bases).
+		 * kallsyms gives the per-CPU section base offset of the variable.
+		 * CPU N's copy lives at: tvec_bases_addr + __per_cpu_offset[N].
+		 * That address holds a struct tvec_base * — read it.
+		 */
+		{
+			unsigned long pcp_addr = tvec_bases_addr +
+						  __per_cpu_offset[cpu];
+			if (vmscan_read(&base_ptr, (void *)pcp_addr,
+					sizeof(base_ptr)))
+				continue;
+		}
+		if (!vmscan_is_kptr(base_ptr))
+			continue;
+		base = base_ptr;
+
+		for (slot = 0; slot < TVEC_BASE_WHEELS; slot++) {
+			unsigned long head_addr;
+			unsigned long cur;
+			int depth = 0;
+
+			head_addr = base + TVB_VEC_OFF +
+				    slot * 2 * sizeof(unsigned long);
+
+			/* Read head.next */
+			if (vmscan_read(&cur, (void *)head_addr, 8))
+				continue;
+
+			while (cur != head_addr && depth < 4096) {
+				unsigned long fn = 0;
+				unsigned long nxt = 0;
+
+				depth++;
+				/* Read timer->function at cur+32 */
+				if (vmscan_read(&fn,
+						(void *)(cur + TL_FUNC_OFF),
+						8))
+					break;
+				/* Read timer->entry.next at cur+0 */
+				if (vmscan_read(&nxt, (void *)cur, 8))
+					break;
+
+				if (fn >= range_start && fn <= range_end) {
+					seq_printf(m,
+						   "  TIMER  cpu=%d slot=%d"
+						   "  timer_list @ 0x%lx"
+						   "  fn=0x%lx\n",
+						   cpu, slot, cur, fn);
+					n_found++;
+				}
+				cur = nxt;
+			}
+		}
+	}
+
+	if (n_found == 0)
+		seq_puts(m, "  (no timers found in that range)\n");
+	else
+		seq_printf(m,
+			   "  Found %d timer(s).\n"
+			   "  To cancel: echo 'cancel-timer <timer_addr>'"
+			   " > /proc/modscan\n", n_found);
+}
+
+/* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
 
 static int modscan_show(struct seq_file *m, void *v)
 {
 	struct modscan_snap *snap;
-	int i, n = 0, n_hidden = 0;
+	int i, n = 0, n_hidden = 0, n_sysfs_tampered = 0;
 
 	snap = snapshot_kset(&n);
 	if (IS_ERR(snap))
@@ -237,7 +923,172 @@ static int modscan_show(struct seq_file *m, void *v)
 	else
 		seq_printf(m, "\n%d hidden module(s) found.\n", n_hidden);
 
-	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
+	/*
+	 * Sysfs tamper check — for each module still in the kset, verify that
+	 * its kernfs_node (kobj->sd) is non-NULL.
+	 *
+	 * kobject_del() removes the kobject from both the kset list and sysfs by
+	 * calling kernfs_remove() which zeroes kobj->sd.  A rootkit that calls
+	 * kobject_del() before list_del() leaves the module invisible to both
+	 * /sys/module/ and /proc/modules, so the standard DKOM check above would
+	 * miss it — but the kobject might still be in the kset list with sd==NULL.
+	 *
+	 * A rootkit that calls kernfs_remove() directly (without list_del on the
+	 * kset) is caught here: the kobject IS in the kset scan above (snapshot),
+	 * but its sysfs entry is gone.
+	 */
+	seq_puts(m, "\n=== Sysfs Integrity Check (kset vs kernfs) ===\n\n");
+	for (i = 0; i < n; i++) {
+		if (strcmp(snap[i].name, THIS_MODULE->name) == 0)
+			continue;
+		/*
+		 * kobj->sd is set by kobject_add() and cleared by kobject_del().
+		 * If it is NULL the sysfs entry no longer exists even though the
+		 * kobject is still linked in the kset.
+		 */
+		if (!snap[i].kobj->sd) {
+			seq_printf(m, "SYSFS-TAMPER  %s  "
+				   "(kset entry present, kernfs node gone)\n",
+				   snap[i].name);
+			n_sysfs_tampered++;
+		}
+	}
+	if (n_sysfs_tampered == 0)
+		seq_puts(m, "(sysfs consistent with kset — no tampering detected)\n");
+	else
+		seq_printf(m, "\n%d sysfs-tampered module(s) found.\n",
+			   n_sysfs_tampered);
+
+	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n"
+	            "           echo 'restore-addr <hex>' > /proc/modscan\n");
+
+	/*
+	 * === Module metadata audit ===
+	 *
+	 * For each module in the modules list, show core_size, init_size, refcnt.
+	 * Rootkits set these to 0xFFFFFFFE (-2 as signed) to impede removal.
+	 */
+	seq_puts(m, "\n=== Module Metadata Audit (detect field corruption) ===\n\n");
+	{
+		struct module *mod;
+		int n_corrupt = 0;
+
+		if (mutex_lock_killable(&module_mutex) == 0) {
+			list_for_each_entry(mod, modules_list_head, list) {
+				unsigned int csz = mod->core_size;
+				unsigned int isz = mod->init_size;
+				long rc = 0;
+#ifdef CONFIG_MODULE_UNLOAD
+				{
+					int cpu;
+					for_each_possible_cpu(cpu) {
+						struct module_ref *mr =
+							per_cpu_ptr(mod->refptr, cpu);
+						rc += (long)mr->incs - (long)mr->decs;
+					}
+				}
+#endif
+				/* Legitimate: csz > 0, csz < 256 MB, rc >= 0 */
+				if (rc < 0 || csz == 0 || csz > (256u << 20)) {
+					seq_printf(m,
+						   "CORRUPT-FIELDS  %-20s"
+						   "  core_sz=%u init_sz=%u refcnt=%ld\n",
+						   mod->name, csz, isz, rc);
+					n_corrupt++;
+				}
+			}
+			mutex_unlock(&module_mutex);
+		}
+		if (n_corrupt == 0)
+			seq_puts(m, "  (all module fields look normal)\n");
+		else
+			seq_printf(m,
+				   "  %d module(s) with corrupted fields.\n"
+				   "  Fix refcnt before rmmod: echo 'fix-refcnt <hex>'"
+				   " > /proc/modscan\n", n_corrupt);
+	}
+
+	/*
+	 * === Syscall table audit ===
+	 *
+	 * Check whether sys_call_table[__NR_delete_module] still points into
+	 * legitimate kernel text.  A hooked entry explains why rmmod returns
+	 * ENOENT for modules that lsmod can see.
+	 */
+	seq_puts(m, "\n=== Syscall Table Audit ===\n\n");
+	{
+		unsigned long *sct;
+		unsigned long fn, ks, ke;
+
+		sct = (unsigned long *)modscan_kallsyms("sys_call_table");
+		ks  = modscan_kallsyms("_stext");
+		ke  = modscan_kallsyms("_etext");
+
+		if (!sct || !ks || !ke) {
+			seq_puts(m, "  (sys_call_table/_stext/_etext not in"
+				    " kallsyms — need CONFIG_KALLSYMS_ALL=y)\n");
+		} else {
+			/* __NR_delete_module = 176 on x86-64 */
+			fn = sct[176];
+			if (fn >= ks && fn <= ke) {
+				seq_printf(m,
+					   "  sys_call_table[176] (delete_module)"
+					   " = 0x%lx  [OK — in kernel text]\n",
+					   fn);
+			} else {
+				seq_printf(m,
+					   "SYSCALL-HOOK  sys_call_table[176]"
+					   " = 0x%lx  [OUTSIDE kernel text"
+					   " 0x%lx-0x%lx] — rmmod is hooked!\n",
+					   fn, ks, ke);
+			}
+
+			/* Also check sys_init_module [NR=175] for completeness */
+			fn = sct[175];
+			if (fn < ks || fn > ke)
+				seq_printf(m,
+					   "SYSCALL-HOOK  sys_call_table[175]"
+					   " (init_module) = 0x%lx  [OUTSIDE"
+					   " kernel text]\n", fn);
+		}
+	}
+
+	/*
+	 * === vmap_area_list scan (Volatility 3 method) ===
+	 *
+	 * Walk the kernel's vmap_area_list directly (not via /proc/vmallocinfo)
+	 * and scan every VM_ALLOC region for a struct module signature.
+	 * This catches modules hidden by list_del() even when kset/sysfs have
+	 * also been cleaned up (kobject_del), i.e. when the kset scan above
+	 * would miss them.
+	 */
+	seq_puts(m, "\n=== vmap_area_list Scan (Volatility 3 Method) ===\n\n");
+	if (mutex_lock_killable(&module_mutex) == 0) {
+		modscan_vmap_scan(m);
+		mutex_unlock(&module_mutex);
+	}
+
+	/*
+	 * Raw module range scan — last resort, catches rootkits that clean up
+	 * ALL tracking structures (modules list + kset + vmap_area_list).
+	 * Directly probes every page in [MODULES_VADDR, MODULES_END] for a
+	 * struct module signature. Does not acquire any lock during the scan.
+	 * Equivalent to what Volatility 3 does on a live memory dump.
+	 */
+	seq_puts(m, "\n=== Raw Module Range Scan (Last Resort) ===\n\n");
+	modscan_raw_scan(m);
+
+#ifdef MODULES_VADDR
+	/*
+	 * Timer scan — look for rootkit watchdog timers whose callback
+	 * sits inside the module vmalloc range.  If found, the timer is
+	 * what re-hides the module after each restore-addr call.
+	 * "cancel-timer <addr>" removes the entry from the wheel.
+	 */
+	seq_puts(m, "\n=== Rootkit Timer Scan ===\n\n");
+	modscan_timer_scan(m, MODULES_VADDR, MODULES_END);
+#endif
+
 	return 0;
 }
 
@@ -260,11 +1111,296 @@ static int modscan_open(struct inode *inode, struct file *file)
  * The spinlock is released before acquiring the mutex because
  * mutex_lock may sleep, which is forbidden in atomic context.
  */
+
+/* ------------------------------------------------------------------ */
+/*  safe-detach — remove rootkit WITHOUT calling exit() or vfree()    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Why not rmmod --force?
+ *   rmmod calls delete_module() which calls mod->exit().
+ *   Sophisticated rootkits put orderly_poweroff() in exit() as a
+ *   self-protection: if you try to unload them, they power off the
+ *   server.  rmmod --force also calls vfree() which frees the code
+ *   pages while hooks may still point into them → use-after-free crash.
+ *
+ * safe-detach does ONLY:
+ *   1. Determine the module's page range (by probing surrounding pages)
+ *   2. Cancel any timers whose callback is in that range
+ *   3. Scan the syscall table for hooks in that range (report only)
+ *   4. list_del the module from the modules list (under module_mutex)
+ *      — this makes lsmod/rmmod blind to it again, but cleanly
+ *   5. Does NOT call mod->exit()
+ *   6. Does NOT call vfree() / module_deallocate()
+ *
+ * Result: the module's memory pages stay mapped forever (orphaned).
+ * Any remaining hooks (proc fops, netfilter, etc.) still call into
+ * live code — no crash.  The server stays up.  Plan a proper reboot
+ * once the persistence mechanism is removed.
+ */
+
+#ifdef MODULES_VADDR
+static ssize_t modscan_safe_detach(unsigned long mod_addr, size_t count)
+{
+	u32           state = 0xff;
+	char          name[MODULE_NAME_LEN + 1];
+	struct module *mod;
+	unsigned long range_start, range_end, page;
+	unsigned long tvec_bases_addr;
+	int  n_timers = 0, n_hooks = 0;
+	int  cpu;
+	unsigned long *sct;
+	unsigned long ks, ke;
+	int  i;
+
+	/* ── Validate ─────────────────────────────────────────────── */
+	if (mod_addr < MODULES_VADDR || mod_addr >= MODULES_END ||
+	    (mod_addr & 7)) {
+		pr_err("modscan: safe-detach: bad address 0x%lx\n", mod_addr);
+		return -ERANGE;
+	}
+	if (vmscan_read(&state, (void *)mod_addr, 4) ||
+	    state > MODULE_STATE_UNFORMED) {
+		pr_err("modscan: safe-detach: no valid struct module at 0x%lx\n",
+		       mod_addr);
+		return -EINVAL;
+	}
+	memset(name, 0, sizeof(name));
+	if (vmscan_read(name, (void *)(mod_addr + 24), MODULE_NAME_LEN))
+		return -EINVAL;
+	name[MODULE_NAME_LEN] = '\0';
+	mod = (struct module *)mod_addr;
+
+	/* ── Determine mapped page range ──────────────────────────── *
+	 * Walk backward and forward from mod_addr until pages become
+	 * unmapped.  Guard pages between vmalloc allocations ensure
+	 * we stop at the correct boundary.
+	 */
+	range_start = mod_addr & PAGE_MASK;
+	for (page = range_start - PAGE_SIZE;
+	     page >= MODULES_VADDR && page < range_start;
+	     page -= PAGE_SIZE) {
+		u8 probe;
+		if (vmscan_read(&probe, (void *)page, 1))
+			break;
+		range_start = page;
+	}
+	range_end = (mod_addr & PAGE_MASK) + PAGE_SIZE;
+	for (page = range_end;
+	     page < MODULES_END;
+	     page += PAGE_SIZE) {
+		u8 probe;
+		if (vmscan_read(&probe, (void *)page, 1))
+			break;
+		range_end = page + PAGE_SIZE;
+	}
+	pr_info("modscan: safe-detach '%s': page range 0x%lx – 0x%lx"
+		" (%lu KB)\n",
+		name, range_start, range_end,
+		(range_end - range_start) >> 10);
+
+	/* ── Cancel timers in range ───────────────────────────────── */
+	tvec_bases_addr = modscan_kallsyms("tvec_bases");
+	if (tvec_bases_addr) {
+		for_each_possible_cpu(cpu) {
+			unsigned long base_ptr = 0;
+			unsigned long base;
+			int slot;
+			unsigned long pcp_addr = tvec_bases_addr +
+						  __per_cpu_offset[cpu];
+
+			if (vmscan_read(&base_ptr, (void *)pcp_addr,
+					sizeof(base_ptr)) ||
+			    !vmscan_is_kptr(base_ptr))
+				continue;
+			base = base_ptr;
+
+			for (slot = 0; slot < TVEC_BASE_WHEELS; slot++) {
+				unsigned long head_addr;
+				unsigned long cur;
+				int depth = 0;
+
+				head_addr = base + TVB_VEC_OFF +
+					    slot * 2 * sizeof(unsigned long);
+				if (vmscan_read(&cur, (void *)head_addr, 8))
+					continue;
+
+				while (cur != head_addr && depth < 4096) {
+					unsigned long fn = 0, nxt = 0;
+
+					depth++;
+					if (vmscan_read(&fn,
+							(void *)(cur + TL_FUNC_OFF),
+							8))
+						break;
+					if (vmscan_read(&nxt, (void *)cur, 8))
+						break;
+
+					if (fn >= range_start &&
+					    fn <  range_end) {
+						struct timer_list *tl =
+							(struct timer_list *)cur;
+						if (del_timer_sync(tl)) {
+							pr_info("modscan:"
+								" safe-detach:"
+								" canceled timer"
+								" @ 0x%lx"
+								" fn=0x%lx\n",
+								cur, fn);
+							n_timers++;
+						}
+					}
+					cur = nxt;
+				}
+			}
+		}
+	}
+	pr_info("modscan: safe-detach: %d timer(s) canceled\n", n_timers);
+
+	/* ── Syscall table hook scan (report only) ────────────────── */
+	sct = (unsigned long *)modscan_kallsyms("sys_call_table");
+	ks  = modscan_kallsyms("_stext");
+	ke  = modscan_kallsyms("_etext");
+	if (sct) {
+		for (i = 0; i < 400; i++) {
+			unsigned long fn;
+
+			if (vmscan_read(&fn, (void *)&sct[i], 8))
+				continue;
+			if (fn >= range_start && fn < range_end) {
+				pr_warn("modscan: safe-detach:"
+					" SYSCALL HOOK sys_call_table[%d]"
+					" = 0x%lx (in rootkit range)\n",
+					i, fn);
+				n_hooks++;
+			}
+		}
+	}
+	if (n_hooks)
+		pr_warn("modscan: safe-detach: %d syscall hook(s) remain"
+			" in orphaned code — consider reboot\n", n_hooks);
+	else
+		pr_info("modscan: safe-detach: no syscall hooks found\n");
+
+	/* ── list_del from modules list ───────────────────────────── *
+	 * Only if the module is currently in the list (restored by a
+	 * prior restore-addr call).  If it has LIST_POISON ptrs, skip
+	 * — it's already not linked.
+	 */
+	if (mutex_lock_killable(&module_mutex) == 0) {
+		if (name_in_modules_list(name)) {
+			list_del(&mod->list);
+			/* Poison the entry so double-del is safe */
+			INIT_LIST_HEAD(&mod->list);
+			pr_info("modscan: safe-detach:"
+				" removed '%s' from modules list\n", name);
+		} else {
+			pr_info("modscan: safe-detach:"
+				" '%s' not in modules list (already hidden)\n",
+				name);
+		}
+		mutex_unlock(&module_mutex);
+	}
+
+	pr_info("modscan: safe-detach: '%s' complete.\n"
+		"  Memory at 0x%lx–0x%lx is ORPHANED (not freed).\n"
+		"  No exit() called — rootkit self-protection bypassed.\n"
+		"  %d syscall hook(s) remain but call into live memory.\n"
+		"  System is stable. Remove persistence then reboot cleanly.\n",
+		name, range_start, range_end, n_hooks);
+
+	return count;
+}
+#endif /* MODULES_VADDR */
+
+/*
+ * modscan_restore_raw() — restore a module whose struct module address was
+ * discovered by the raw memory scan (modscan_raw_scan).
+ *
+ * Used when the rootkit has removed the module from ALL kernel tracking
+ * structures (modules list + kset/sysfs), leaving no linked-list path to
+ * find the struct module *.  The raw scan gives us the virtual address
+ * directly; this function validates it and re-links the module.
+ *
+ * Safety checks before touching anything:
+ *   1. Address in [MODULES_VADDR, MODULES_END), 8-byte aligned
+ *   2. state field valid (0-3)
+ *   3. name field printable ASCII, non-empty
+ *   4. Module is NOT already in the modules list (idempotent)
+ */
+#ifdef MODULES_VADDR
+static ssize_t modscan_restore_raw(unsigned long raw_addr, size_t count)
+{
+	struct module *mod;
+	u32 state = 0xff;
+	char name[MODULE_NAME_LEN + 1] = {};
+	int i, nlen = -1;
+
+	/* [1] Range and alignment */
+	if (raw_addr < MODULES_VADDR || raw_addr >= MODULES_END ||
+	    (raw_addr & 7)) {
+		pr_err("modscan: restore-addr 0x%lx out of range/misaligned\n",
+		       raw_addr);
+		return -ERANGE;
+	}
+
+	/* [2] state */
+	if (vmscan_read(&state, (void *)raw_addr, 4) ||
+	    state > MODULE_STATE_UNFORMED) {
+		pr_err("modscan: restore-addr 0x%lx: invalid state\n", raw_addr);
+		return -EINVAL;
+	}
+
+	/* [3] name */
+	if (vmscan_read(name, (void *)(raw_addr + 24), MODULE_NAME_LEN)) {
+		pr_err("modscan: restore-addr 0x%lx: cannot read name\n",
+		       raw_addr);
+		return -EINVAL;
+	}
+	name[MODULE_NAME_LEN] = '\0';
+	for (i = 0; i < MODULE_NAME_LEN; i++) {
+		if (name[i] == '\0') { nlen = i; break; }
+		if ((unsigned char)name[i] < 0x20 ||
+		    (unsigned char)name[i] >= 0x7f)
+			break;
+	}
+	if (nlen <= 0) {
+		pr_err("modscan: restore-addr 0x%lx: invalid name\n", raw_addr);
+		return -EINVAL;
+	}
+
+	mod = (struct module *)raw_addr;
+
+	/* [4] Re-link under module_mutex */
+	if (mutex_lock_killable(&module_mutex))
+		return -EINTR;
+
+	if (name_in_modules_list(name)) {
+		mutex_unlock(&module_mutex);
+		pr_info("modscan: '%s' is already in the modules list\n", name);
+		return -EEXIST;
+	}
+
+	/*
+	 * Re-insert at the tail of the modules list.
+	 * list_add() overwrites mod->list.next/prev, clearing any LIST_POISON
+	 * values left by the rootkit's list_del() call.
+	 * After this, lsmod and rmmod will find the module again.
+	 */
+	list_add_tail(&mod->list, modules_list_head);
+	mutex_unlock(&module_mutex);
+
+	pr_info("modscan: module '%s' @ 0x%lx restored to modules list\n",
+		name, raw_addr);
+	return count;
+}
+#endif /* MODULES_VADDR */
+
 static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 			     size_t count, loff_t *ppos)
 {
-	/* "restore " (8) + MODULE_NAME_LEN (56) + NUL */
-	char kbuf[8 + MODULE_NAME_LEN];
+	/* longest command: "restore-addr 0xffffffffffffffff\n" = 32 bytes */
+	char kbuf[64];
 	char modname[MODULE_NAME_LEN];
 	struct kobject        *kobj;
 	struct module_kobject *mkobj;
@@ -280,9 +1416,156 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	if (len > 0 && kbuf[len - 1] == '\n')
 		kbuf[--len] = '\0';
 
+	/*
+	 * Command: restore-addr <hex>
+	 *
+	 * Use when the rootkit has also removed the module from module_kset
+	 * (so "restore <name>" cannot find it).  Supply the address printed
+	 * by the Raw Module Range Scan section of /proc/modscan.
+	 *
+	 * Example:
+	 *   echo 'restore-addr 0xffffffffc0931a80' > /proc/modscan
+	 */
+#ifdef MODULES_VADDR
+	if (strncmp(kbuf, "restore-addr ", 13) == 0) {
+		unsigned long raw_addr = 0;
+
+		if (kstrtoul(kbuf + 13, 16, &raw_addr)) {
+			pr_err("modscan: restore-addr: bad hex address\n");
+			return -EINVAL;
+		}
+		return modscan_restore_raw(raw_addr, count);
+	}
+#endif
+
+	/*
+	 * Command: fix-refcnt <hex>
+	 *
+	 * A rootkit that sets mod->core_size = 0xFFFFFFFE and
+	 * atomic_set(&mod->refcnt, -2) prevents clean removal even after the
+	 * module is restored to the modules list.  This command resets those
+	 * fields to legitimate values so rmmod --force can proceed.
+	 *
+	 * Supply the address from the Raw Module Range Scan output.
+	 *
+	 * Example:
+	 *   echo 'fix-refcnt 0xffffffffc0931a80' > /proc/modscan
+	 */
+#ifdef MODULES_VADDR
+#ifdef MODULES_VADDR
+	if (strncmp(kbuf, "safe-detach ", 12) == 0) {
+		unsigned long sd_addr = 0;
+
+		if (kstrtoul(kbuf + 12, 16, &sd_addr)) {
+			pr_err("modscan: safe-detach: bad address\n");
+			return -EINVAL;
+		}
+		return modscan_safe_detach(sd_addr, count);
+	}
+#endif
+
+	if (strncmp(kbuf, "fix-refcnt ", 11) == 0) {
+		unsigned long fix_addr = 0;
+		struct module *fmod;
+		u32 state = 0xff;
+		char fname[MODULE_NAME_LEN + 1] = {};
+
+		if (kstrtoul(kbuf + 11, 16, &fix_addr)) {
+			pr_err("modscan: fix-refcnt: bad hex address\n");
+			return -EINVAL;
+		}
+		if (fix_addr < MODULES_VADDR || fix_addr >= MODULES_END ||
+		    (fix_addr & 7)) {
+			pr_err("modscan: fix-refcnt: address out of range\n");
+			return -ERANGE;
+		}
+		if (vmscan_read(&state, (void *)fix_addr, 4) ||
+		    state > MODULE_STATE_UNFORMED) {
+			pr_err("modscan: fix-refcnt: invalid state at 0x%lx\n",
+			       fix_addr);
+			return -EINVAL;
+		}
+		if (vmscan_read(fname, (void *)(fix_addr + 24),
+				MODULE_NAME_LEN))
+			return -EINVAL;
+		fname[MODULE_NAME_LEN] = '\0';
+
+		fmod = (struct module *)fix_addr;
+
+		/*
+		 * Reset only the fields the rootkit corrupts to block removal:
+		 *   refcnt  → 0  (module has no users)
+		 *   state   → MODULE_STATE_LIVE  (was left as LIVE but be explicit)
+		 *
+		 * We do NOT guess at core_size/init_size; those are only used
+		 * for display in /proc/modules and for the freeing path, which
+		 * we skip here.  rmmod --force will trigger the exit() path
+		 * without checking size.
+		 */
+		fmod->state = MODULE_STATE_LIVE;
+#ifdef CONFIG_MODULE_UNLOAD
+		/* Zero per-CPU reference counters (3.10 uses refptr, not atomic refcnt) */
+		{
+			int cpu;
+			for_each_possible_cpu(cpu) {
+				struct module_ref *mr = per_cpu_ptr(fmod->refptr, cpu);
+				mr->incs = 0;
+				mr->decs = 0;
+			}
+		}
+#endif
+
+		pr_info("modscan: fix-refcnt: '%s' @ 0x%lx"
+			" — refcnt reset to 0, state set LIVE\n",
+			fname, fix_addr);
+		return count;
+	}
+#endif
+
+	/*
+	 * Command: cancel-timer <hex>
+	 *
+	 * Remove a struct timer_list from its timer wheel bucket.
+	 * Use the address printed by "=== Rootkit Timer Scan ===" above.
+	 * After canceling the watchdog timer the rootkit can no longer
+	 * re-hide itself; restore-addr + rmmod --force will then work.
+	 *
+	 * Example:
+	 *   echo 'cancel-timer 0xffffffffc0931000' > /proc/modscan
+	 */
+	if (strncmp(kbuf, "cancel-timer ", 13) == 0) {
+		unsigned long taddr = 0;
+		struct timer_list *tl;
+
+		if (kstrtoul(kbuf + 13, 16, &taddr)) {
+			pr_err("modscan: cancel-timer: bad hex address\n");
+			return -EINVAL;
+		}
+		if (!vmscan_is_kptr(taddr)) {
+			pr_err("modscan: cancel-timer: invalid address\n");
+			return -EINVAL;
+		}
+		tl = (struct timer_list *)taddr;
+		/*
+		 * del_timer_sync() waits for any running instance to
+		 * finish and then removes the timer from the wheel.
+		 * Returns 1 if the timer was pending, 0 if not.
+		 */
+		if (del_timer_sync(tl))
+			pr_info("modscan: timer @ 0x%lx canceled\n", taddr);
+		else
+			pr_info("modscan: timer @ 0x%lx was not pending\n",
+				taddr);
+		return count;
+	}
+
 	if (sscanf(kbuf, "restore %55s", modname) != 1) {
 		pr_err("modscan: unknown command '%s'\n"
-		       "modscan: usage: echo 'restore <name>' > /proc/modscan\n",
+		       "modscan: usage:\n"
+		       "  echo 'restore <name>' > /proc/modscan\n"
+		       "  echo 'restore-addr <hex>' > /proc/modscan\n"
+		       "  echo 'fix-refcnt <hex>' > /proc/modscan\n"
+		       "  echo 'cancel-timer <hex>' > /proc/modscan\n",
 		       kbuf);
 		return -EINVAL;
 	}
@@ -301,7 +1584,11 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	spin_unlock(&modscan_kset->list_lock);
 
 	if (!target) {
-		pr_err("modscan: '%s' not found in module kset\n", modname);
+		pr_err("modscan: '%s' not found in module kset\n"
+		       "modscan: if the rootkit removed it from kset too, use:\n"
+		       "  echo 'restore-addr <hex>' > /proc/modscan\n"
+		       "  (address from the Raw Module Range Scan output)\n",
+		       modname);
 		return -ENOENT;
 	}
 
