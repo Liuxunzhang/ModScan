@@ -11,6 +11,9 @@
  *   3. finit_module / init_module / load_module / tcp4_seq_show 等内联 patch
  *   4. 系统调用表指针劫持 (sys_call_table[313/175/78/217])
  *   5. Skidmap 恶意软件特征（已知模块名、getdents64 hook、PAM 后门、ld.so.preload）
+ *   6. kset/sysfs 完整性交叉验证
+ *      ─ 直接通过 kcore 遍历 module_kset->list（内存可信源），与 /sys/module/ 和
+ *        /proc/modules 交叉比对，检测 kobject_del 或 kernfs_remove 篡改 sysfs 的高级 rootkit
  *
  * struct module 布局（x86-64，无 __randomize_layout，跨内核版本稳定）：
  *   offset  0: enum module_state state   (4 bytes)
@@ -599,7 +602,191 @@ static void check_syscall_table(void)
     }
 }
 
-/* ─── CHECK 5: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
+/* ─── CHECK 5: kset/sysfs 完整性交叉验证 ────────────────────────────────── */
+/*
+ * struct kobject 内存布局（x86-64，Linux 4.x~6.x 稳定）：
+ *   offset  0 : const char      *name    — 指向名字字符串的指针
+ *   offset  8 : struct list_head entry   — kset 链表节点（next@+8, prev@+16）
+ *   offset 24 : struct kobject   *parent
+ *   offset 32 : struct kset      *kset
+ *   offset 40 : const struct kobj_type *ktype
+ *   offset 48 : struct kernfs_node *sd   — sysfs/kernfs 节点指针
+ *   offset 56 : struct kref       kref
+ *
+ * struct kset 内存布局（x86-64）：
+ *   offset  0 : struct list_head  list   — 成员 kobject 链表哨兵（sentinel）
+ *   offset 16 : spinlock_t        list_lock
+ *   offset 24 : struct kobject    kobj
+ *   ...
+ *
+ * 遍历 module_kset->list：
+ *   sentinel = kset_ptr（即 &kset->list，address of list_head）
+ *   cur      = *kset_ptr（即 kset->list.next，第一个成员 kobject 的 entry 地址）
+ *   kobj     = cur - 8（从 entry 字段退回 kobject 起始）
+ *   name_ptr = *(kobj + 0)  →  读字符串
+ */
+#define KOBJ_NAME_OFF    0   /* const char *name  在 kobject 内的偏移 */
+#define KOBJ_ENTRY_OFF   8   /* list_head entry   在 kobject 内的偏移 */
+#define KOBJ_SD_OFF     48   /* kernfs_node *sd   在 kobject 内的偏移 */
+
+#define MAX_KSET_WALK 1024
+
+static modinfo_t kset_wlist[MAX_KSET_WALK];   /* kcore kset 遍历结果 */
+static int       kset_wlist_n = -1;            /* -1 = 尚未执行 */
+
+/*
+ * do_walk_kset() — 通过 kcore 直接遍历 module_kset->list。
+ *
+ * "module_kset" 是内核中的 static struct kset * 变量，kallsyms 给出的是指针
+ * 变量本身的地址，需要额外一次解引用才能得到实际的 kset 地址。
+ *
+ * 返回找到的模块数，失败返回 -1。结果存入 kset_wlist[]。
+ */
+static int do_walk_kset(void)
+{
+    /* 1. 获取 module_kset 变量地址 */
+    uint64_t kset_var = sym_addr("module_kset");
+    if (!kset_var) {
+        warn("  'module_kset' 不在 kallsyms（需要 CONFIG_KALLSYMS_ALL=y）");
+        return -1;
+    }
+
+    /* 2. 读取指针本身，得到实际 kset 地址 */
+    uint64_t kset_ptr = 0;
+    if (!kcore_read_u64(kset_var, &kset_ptr) || !kset_ptr) {
+        warn("  无法读取 module_kset 指针 (var @ %#lx)", (unsigned long)kset_var);
+        return -1;
+    }
+
+    /*
+     * 3. 遍历 kset->list（offset 0 of kset）
+     *    sentinel  = kset_ptr  （= &kset->list，即哨兵 list_head 的地址）
+     *    第一步读  *kset_ptr   得到 kset->list.next（第一个 kobject.entry 的地址）
+     */
+    uint64_t sentinel = kset_ptr;
+    uint64_t cur      = 0;
+    if (!kcore_read_u64(sentinel, &cur)) {
+        warn("  无法读取 kset->list.next (kset @ %#lx)", (unsigned long)kset_ptr);
+        return -1;
+    }
+
+    int n     = 0;
+    int guard = 0;   /* 防无限循环 */
+
+    while (cur != sentinel && n < MAX_KSET_WALK && guard < 4096) {
+        guard++;
+
+        /*
+         * cur 指向某个 kobject 的 entry 字段（list_head，偏移 8）
+         * 减去偏移得到 kobject 起始地址
+         */
+        uint64_t kobj = cur - KOBJ_ENTRY_OFF;
+
+        /* 读 kobject.name 指针 */
+        uint64_t name_ptr = 0;
+        if (!kcore_read_u64(kobj + KOBJ_NAME_OFF, &name_ptr) || !name_ptr)
+            goto next_entry;
+
+        /* 跟随指针读取名字字符串 */
+        char name[MODULE_NAME_LEN] = {0};
+        if (kcore_read(name_ptr, name, MODULE_NAME_LEN - 1) < 0)
+            goto next_entry;
+        name[MODULE_NAME_LEN - 1] = '\0';
+
+        /* 合法性验证：全部非 NUL 字符必须是可打印 ASCII */
+        {
+            bool valid = (name[0] != '\0');
+            for (int j = 0; valid && j < (int)sizeof(name) && name[j]; j++) {
+                if (name[j] < 0x20 || name[j] >= 0x7f)
+                    valid = false;
+            }
+            if (valid) {
+                strncpy(kset_wlist[n].name, name, MODULE_NAME_LEN - 1);
+                kset_wlist[n].mod_addr = kobj;
+                n++;
+            }
+        }
+
+next_entry:
+        /* 跟随 list_head.next 到下一个节点 */
+        if (!kcore_read_u64(cur, &cur))
+            break;
+    }
+
+    return n;
+}
+
+static void check_kset_sysfs_integrity(void)
+{
+    info("CHECK 5: module_kset / sysfs / proc 三源完整性交叉验证");
+    printf("  原理：直接通过 kcore 遍历内核内存中的 module_kset->list（比 /sys/module/ 更可信），\n"
+           "        与 /sys/module/ 和 /proc/modules 两个用户可见视图交叉比对，\n"
+           "        检测 kobject_del() 或 kernfs_remove() 单独篡改 sysfs 的高级 rootkit。\n\n");
+
+    kset_wlist_n = do_walk_kset();
+    if (kset_wlist_n < 0) {
+        warn("  kset 遍历失败，跳过此项检测");
+        return;
+    }
+    printf("    kcore kset 遍历结果: %d 个模块 kobject\n", kset_wlist_n);
+    printf("    /sys/module/ 视图  : %d 个 LKM\n",          sysfs_modlist_n);
+    printf("    /proc/modules 视图 : %d 个模块\n\n",         procmod_list_n);
+
+    int findings_before = g_findings;
+
+    /* ── A: kcore kset 有，但 /sys/module/ 没有 ─────────────────────────── */
+    /*    说明 sysfs 条目被单独删除：rootkit 调用了 kernfs_remove() 或          */
+    /*    kobject_del() 但没有从 modules 链表中摘除（或已从 modules 摘除但      */
+    /*    遗留了 kset 记录）。                                                   */
+    for (int i = 0; i < kset_wlist_n; i++) {
+        if (!name_in_list(kset_wlist[i].name, sysfs_modlist, sysfs_modlist_n)) {
+            alert("  SYSFS-TAMPER: '%s' 存在于 kcore kset 链表，但 /sys/module/%s/ 不存在！",
+                  kset_wlist[i].name, kset_wlist[i].name);
+            printf("       kobj地址: %#lx\n",
+                   (unsigned long)kset_wlist[i].mod_addr);
+            printf("       → sysfs 条目已被单独删除（kernfs_remove / kobject_del）\n");
+            /* 检查是否也从 /proc/modules 中消失 */
+            if (!name_in_list(kset_wlist[i].name, procmod_list, procmod_list_n)) {
+                printf("       → 且不在 /proc/modules：已被双重隐藏（仅 kset 中残留）\n");
+            }
+            FINDING();
+        }
+    }
+
+    /* ── B: /sys/module/ 有，但 kcore kset 没有 ─────────────────────────── */
+    /*    说明 kset 链表被直接篡改：rootkit 对 kobj->entry 调用了 list_del()   */
+    /*    但没有通过 kobject_del() 清理 sysfs（或这是正常 kernfs 虚拟节点）。   */
+    for (int i = 0; i < sysfs_modlist_n; i++) {
+        if (!name_in_list(sysfs_modlist[i].name, kset_wlist, kset_wlist_n)) {
+            alert("  KSET-TAMPER: '/sys/module/%s/' 存在，但不在 kcore kset 链表中！",
+                  sysfs_modlist[i].name);
+            printf("       → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留\n");
+            FINDING();
+        }
+    }
+
+    /* ── C: kcore kset 有，但 /proc/modules 和 /sys/module/ 都没有 ─────── */
+    /*    最隐蔽的变种：rootkit 同时清理了 modules 链表和 sysfs，但 kset 中    */
+    /*    仍有残留，属于不完整的双重 DKOM。                                     */
+    for (int i = 0; i < kset_wlist_n; i++) {
+        bool in_sysfs = name_in_list(kset_wlist[i].name, sysfs_modlist, sysfs_modlist_n);
+        bool in_proc  = name_in_list(kset_wlist[i].name, procmod_list,  procmod_list_n);
+        if (!in_sysfs && !in_proc) {
+            alert("  FULLY-HIDDEN: '%s' 仅存于 kcore kset，/sys/module/ 和 /proc/modules 均无！",
+                  kset_wlist[i].name);
+            printf("       kobj地址: %#lx\n",
+                   (unsigned long)kset_wlist[i].mod_addr);
+            printf("       → 高级双重 DKOM：模块已从 sysfs 和 modules 链表中全部清除，\n");
+            printf("         但内存中的 kset 链表节点未被完全清理（rootkit 残留）\n");
+            FINDING();
+        }
+    }
+
+    if (g_findings == findings_before)
+        ok("  kset / sysfs / /proc/modules 三视图一致，未发现篡改");
+}
+
+/* ─── CHECK 7: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
 /*
  * Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，其内核模块通过以下手段隐藏：
  *   - 劫持 getdents64 系统调用（已在 CHECK 4 中检测）
@@ -610,7 +797,7 @@ static void check_syscall_table(void)
  */
 static void check_skidmap_indicators(void)
 {
-    info("CHECK 5: Skidmap 恶意软件特征检测");
+    info("CHECK 7: Skidmap 恶意软件特征检测");
 
     /* ── 1. 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）────────────── */
     printf("  [1] 已知 Skidmap 内核模块名扫描\n");
@@ -832,8 +1019,9 @@ int main(void)
     check_hidden_modules();    printf("\n");
 
     if (kcore_fd >= 0) {
-        check_function_integrity(); printf("\n");
-        check_syscall_table();      printf("\n");
+        check_kset_sysfs_integrity(); printf("\n");   /* 新增：kset/sysfs 交叉验证 */
+        check_function_integrity();   printf("\n");
+        check_syscall_table();        printf("\n");
     }
 
     check_skidmap_indicators(); printf("\n");

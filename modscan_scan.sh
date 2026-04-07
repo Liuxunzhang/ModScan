@@ -392,10 +392,223 @@ PYEOF
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 6: 模块签名强制检测
+# CHECK 6: kset / sysfs 完整性交叉验证
+#
+# 原理：
+#   通过 /proc/kcore 直接遍历内核内存中的 module_kset->list（比 /sys/module/ 更可信），
+#   与 /sys/module/ 和 /proc/modules 交叉比对，检测三种篡改场景：
+#
+#   A. kcore kset 有 → /sys/module/ 没有：sysfs 条目被单独删除
+#      （rootkit 调用 kernfs_remove() 或 kobject_del()）
+#
+#   B. /sys/module/ 有 → kcore kset 没有：kset 链表被直接篡改
+#      （rootkit 对 kobj->entry 调用 list_del()，sysfs 残留）
+#
+#   C. kcore kset 有 → /proc/modules 和 /sys/module/ 都没有：
+#      高级双重 DKOM，kset 中仍有残留（最隐蔽变种）
+#
+# struct kobject 内存布局（x86-64，Linux 4.x~6.x 稳定）：
+#   offset  0 : const char *name  — 名字字符串指针
+#   offset  8 : list_head entry   — kset 链表节点
+#   offset 48 : kernfs_node *sd   — sysfs 节点指针（NULL = sysfs 已被删除）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+check_kset_sysfs() {
+    info "CHECK 6: module_kset / sysfs / proc 三源完整性交叉验证（via /proc/kcore）"
+
+    if [[ ! -r /proc/kcore ]]; then
+        warn "  /proc/kcore 不可读——跳过 kset/sysfs 交叉验证"
+        return
+    fi
+    if ! command -v python3 &>/dev/null; then
+        warn "  python3 未找到——跳过 kset/sysfs 交叉验证，可使用 modscan_kcore 工具"
+        return
+    fi
+
+    local py_ret=0
+    python3 - <<'PYEOF' || py_ret=$?
+import struct, sys, os
+
+KCORE = "/proc/kcore"
+KSYMS = "/proc/kallsyms"
+
+# ── 读取 kallsyms ────────────────────────────────────────────────────────────
+syms = {}
+try:
+    with open(KSYMS) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                syms[parts[2]] = int(parts[0], 16)
+except PermissionError:
+    print("  [!] /proc/kallsyms 不可读", file=sys.stderr)
+    sys.exit(2)
+
+def sym(name):
+    return syms.get(name, 0)
+
+# ── /proc/kcore ELF 读取器（复用 CHECK 4+5 的同款实现）────────────────────
+class KCore:
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.segs = []
+        hdr = self._pread(0, 64)
+        if hdr[:4] != b'\x7fELF':
+            raise ValueError("不是 ELF 文件")
+        e_phoff     = struct.unpack_from('<Q', hdr, 32)[0]
+        e_phentsize = struct.unpack_from('<H', hdr, 54)[0]
+        e_phnum     = struct.unpack_from('<H', hdr, 56)[0]
+        for i in range(e_phnum):
+            ph = self._pread(e_phoff + i * e_phentsize, 56)
+            p_type = struct.unpack_from('<I', ph, 0)[0]
+            if p_type != 1:
+                continue
+            self.segs.append((
+                struct.unpack_from('<Q', ph, 16)[0],   # p_vaddr
+                struct.unpack_from('<Q', ph, 32)[0],   # p_filesz
+                struct.unpack_from('<Q', ph, 8)[0],    # p_offset
+            ))
+
+    def _pread(self, offset, n):
+        return os.pread(self.f.fileno(), n, offset)
+
+    def read(self, vaddr, n):
+        for (va, sz, off) in self.segs:
+            if va <= vaddr < va + sz and vaddr + n <= va + sz:
+                d = self._pread(off + (vaddr - va), n)
+                if len(d) == n:
+                    return d
+        return None
+
+    def read_u64(self, vaddr):
+        d = self.read(vaddr, 8)
+        return struct.unpack_from('<Q', d)[0] if d else None
+
+try:
+    kc = KCore(KCORE)
+except Exception as e:
+    print(f"  [!] 无法打开 /proc/kcore: {e}", file=sys.stderr)
+    sys.exit(2)
+
+# ── 遍历 module_kset->list ────────────────────────────────────────────────────
+#
+# struct kobject 偏移（x86-64，Linux 4.x~6.x）:
+#   +0  : const char *name    (指向名字字符串的指针)
+#   +8  : list_head  entry    (kset 链表节点, next@+8, prev@+16)
+#   +48 : kernfs_node *sd     (sysfs 节点，NULL = sysfs 已删除)
+#
+# module_kset 是 static struct kset * 变量；kallsyms 给出指针变量地址，
+# 需额外一次解引用才得到实际 kset。
+# kset->list 是偏移 0 处的 list_head（sentinel）。
+#
+KOBJ_NAME_OFF = 0
+KOBJ_ENTRY_OFF = 8
+KOBJ_SD_OFF   = 48
+
+kset_var = sym('module_kset')
+if not kset_var:
+    print("  [-] 'module_kset' 不在 kallsyms（需要 CONFIG_KALLSYMS_ALL=y）")
+    sys.exit(2)
+
+kset_ptr = kc.read_u64(kset_var)
+if not kset_ptr:
+    print("  [!] 无法读取 module_kset 指针")
+    sys.exit(2)
+
+sentinel = kset_ptr          # &kset->list
+cur = kc.read_u64(sentinel)  # kset->list.next = 第一个 kobject 的 entry 地址
+if cur is None:
+    print("  [!] 无法读取 kset->list.next")
+    sys.exit(2)
+
+kset_names = {}   # name → (kobj_ptr, sd_ptr)
+guard = 0
+while cur != sentinel and guard < 4096:
+    guard += 1
+    kobj = cur - KOBJ_ENTRY_OFF  # 从 entry 字段退回 kobject 起始
+    name_ptr = kc.read_u64(kobj + KOBJ_NAME_OFF)
+    if name_ptr:
+        raw = kc.read(name_ptr, 56)
+        if raw:
+            name = raw.split(b'\x00')[0].decode('ascii', errors='replace')
+            if name and all(0x20 <= ord(c) < 0x7f for c in name):
+                sd_ptr = kc.read_u64(kobj + KOBJ_SD_OFF) or 0
+                kset_names[name] = (kobj, sd_ptr)
+    next_ptr = kc.read_u64(cur)
+    if next_ptr is None:
+        break
+    cur = next_ptr
+
+print(f"    kcore kset 遍历结果: {len(kset_names)} 个模块 kobject")
+
+# ── 读取 /sys/module/ 列表 ───────────────────────────────────────────────────
+import os as _os
+sysfs_mods = set()
+try:
+    for entry in _os.scandir('/sys/module'):
+        if entry.is_dir() and _os.path.exists(f'/sys/module/{entry.name}/initstate'):
+            sysfs_mods.add(entry.name)
+except Exception as e:
+    print(f"  [!] 无法扫描 /sys/module/: {e}", file=sys.stderr)
+
+# ── 读取 /proc/modules 列表 ─────────────────────────────────────────────────
+proc_mods = set()
+try:
+    with open('/proc/modules') as f:
+        for line in f:
+            proc_mods.add(line.split()[0])
+except Exception as e:
+    print(f"  [!] 无法读取 /proc/modules: {e}", file=sys.stderr)
+
+print(f"    /sys/module/ 视图  : {len(sysfs_mods)} 个 LKM")
+print(f"    /proc/modules 视图 : {len(proc_mods)} 个模块\n")
+
+findings = 0
+
+# ── A: kcore kset 有，但 /sys/module/ 没有 ──────────────────────────────────
+for name, (kobj, sd) in kset_names.items():
+    if name not in sysfs_mods:
+        extra = ""
+        if name not in proc_mods:
+            extra = "（且不在 /proc/modules：高级双重 DKOM，kset 中仍有残留）"
+        print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中但 /sys/module/{name}/ 不存在！{extra}")
+        print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
+        print(f"            → sysfs 条目已被单独删除（kernfs_remove / kobject_del）")
+        findings += 1
+
+# ── B: kcore kset 中 sd==NULL（sysfs 节点已删除但 kobject 仍在 kset）────────
+for name, (kobj, sd) in kset_names.items():
+    if sd == 0 and name in sysfs_mods:
+        # sd is NULL but sysfs dir still visible — inconsistent state
+        print(f"\033[0;31m    [ALERT]\033[0m SD-NULL: '{name}' 的 kobject.sd == NULL，但 /sys/module/{name}/ 仍存在")
+        print(f"            kobj地址: {kobj:#x}")
+        print(f"            → kernfs 节点已被 kobject_del() 清除，sysfs 目录残留（不一致状态）")
+        findings += 1
+
+# ── C: /sys/module/ 有，但 kcore kset 没有 ──────────────────────────────────
+for name in sysfs_mods:
+    if name not in kset_names:
+        print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 存在，但不在 kcore kset 链表中！")
+        print(f"            → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留")
+        findings += 1
+
+if findings == 0:
+    print("\033[0;32m    [+]\033[0m kset / sysfs / /proc/modules 三视图一致，未发现 kset/sysfs 篡改")
+
+sys.exit(1 if findings > 0 else 0)
+PYEOF
+
+    if [[ $py_ret -eq 1 ]]; then
+        flag
+    elif [[ $py_ret -eq 2 ]]; then
+        warn "  kset/sysfs 交叉验证因错误中止"
+    fi
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHECK 7: 模块签名强制检测
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_sig_enforce() {
-    info "CHECK 6: 模块签名强制 (sig_enforce)"
+    info "CHECK 7: 模块签名强制 (sig_enforce)"
 
     local SIG=/proc/sys/kernel/sig_enforce
     if [[ ! -f "$SIG" ]]; then
@@ -561,6 +774,8 @@ echo
 check_kallsyms_orphans
 echo
 check_hooks_via_kcore
+echo
+check_kset_sysfs
 echo
 check_sig_enforce
 echo

@@ -29,6 +29,7 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kernfs.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -136,7 +137,8 @@ static int __init resolve_symbols(void)
 #define MODSCAN_MAX_SNAP 512
 
 struct modscan_snap {
-	char name[MODULE_NAME_LEN];
+	char            name[MODULE_NAME_LEN];
+	struct kobject *kobj;   /* pointer to the module's kobject in kset */
 };
 
 /*
@@ -176,6 +178,7 @@ static struct modscan_snap *snapshot_kset(int *out_n)
 
 		strncpy(snap[n].name, mkobj->mod->name, MODULE_NAME_LEN - 1);
 		snap[n].name[MODULE_NAME_LEN - 1] = '\0';
+		snap[n].kobj = kobj;
 		n++;
 	}
 	spin_unlock(&modscan_kset->list_lock);
@@ -236,6 +239,43 @@ static int modscan_show(struct seq_file *m, void *v)
 		seq_puts(m, "(no hidden modules detected)\n");
 	else
 		seq_printf(m, "\n%d hidden module(s) found.\n", n_hidden);
+
+	/*
+	 * Sysfs tamper check — for each module still in the kset, verify that
+	 * its kernfs_node (kobj->sd) is non-NULL.
+	 *
+	 * kobject_del() removes the kobject from both the kset list and sysfs by
+	 * calling kernfs_remove() which zeroes kobj->sd.  A rootkit that calls
+	 * kobject_del() before list_del() leaves the module invisible to both
+	 * /sys/module/ and /proc/modules, so the standard DKOM check above would
+	 * miss it — but the kobject might still be in the kset list with sd==NULL.
+	 *
+	 * A rootkit that calls kernfs_remove() directly (without list_del on the
+	 * kset) is caught here: the kobject IS in the kset scan above (snapshot),
+	 * but its sysfs entry is gone.
+	 */
+	seq_puts(m, "\n=== Sysfs Integrity Check (kset vs kernfs) ===\n\n");
+	int n_sysfs_tampered = 0;
+	for (i = 0; i < n; i++) {
+		if (strcmp(snap[i].name, THIS_MODULE->name) == 0)
+			continue;
+		/*
+		 * kobj->sd is set by kobject_add() and cleared by kobject_del().
+		 * If it is NULL the sysfs entry no longer exists even though the
+		 * kobject is still linked in the kset.
+		 */
+		if (!snap[i].kobj->sd) {
+			seq_printf(m, "SYSFS-TAMPER  %s  "
+				   "(kset entry present, kernfs node gone)\n",
+				   snap[i].name);
+			n_sysfs_tampered++;
+		}
+	}
+	if (n_sysfs_tampered == 0)
+		seq_puts(m, "(sysfs consistent with kset — no tampering detected)\n");
+	else
+		seq_printf(m, "\n%d sysfs-tampered module(s) found.\n",
+			   n_sysfs_tampered);
 
 	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
 	return 0;
