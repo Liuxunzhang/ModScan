@@ -444,25 +444,66 @@ static void modscan_vmap_scan(struct seq_file *m)
  *   kernel 3.10-6.x:  0xffffffffa0000000 – 0xfffffffffff00000
  *   (~1.5 GB range, ~390K pages; ~80-400 ms scan with nofault probing)
  *
- * Performance: the function probes MOD_SIG_BYTES (80B) per page.
- * Unmapped pages return immediately (-EFAULT). Mapped non-module pages
- * fail the state/pointer/name checks quickly. Only genuine struct module
- * pages pass all five criteria and trigger a full report.
+ * WHY THE PREVIOUS VERSION ONLY FOUND 13 OF 106 MODULES:
+ *
+ *   struct module is NOT at offset 0 of its vmalloc allocation.
+ *   It lives inside the .data section (.gnu.linkonce.this_module),
+ *   which comes after .text and .rodata in the allocation layout:
+ *
+ *     [vmalloc base]  .text  .rodata  .data←struct module  .bss
+ *
+ *   Reading only the first 80 bytes of each page misses every module
+ *   whose struct is at a non-zero page-relative offset.
+ *
+ * FIX — sliding window within each mapped page:
+ *
+ *   1. Read the entire page (4096 B) with one vmscan_read call.
+ *      Unmapped pages fail instantly (-EFAULT); mapped pages are cheap.
+ *   2. Slide an 80-byte window at 8-byte steps across the page.
+ *      (struct module is always at least 8-byte aligned.)
+ *   3. Apply the 5-stage filter at each window position.
+ *
+ *   This catches struct module at any 8B-aligned offset within any
+ *   mapped page — exactly what Volatility 3 does on a raw memory dump.
+ *
+ * Performance (390 K pages, ~1 K mapped):
+ *   Unmapped: 390 K × ~300 ns = ~120 ms  (one fast fault per page)
+ *   Mapped:   1 K × [(4 KB read) + 501 windows × fast filter] ≈ 10 ms
+ *   Total: < 200 ms
  */
 
-/* Candidate found during the raw scan (stored before mutex is taken) */
+/* Candidate found during phase-1 scan (before mutex is acquired) */
 #define MODSCAN_MAX_CANDS 512
 
+/*
+ * LIST_POISON1/2 are set by list_del() in the deleted entry's own next/prev
+ * fields.  On x86-64: POISON_POINTER_DELTA = 0xdead000000000000
+ *   LIST_POISON1 = 0xdead000000000100
+ *   LIST_POISON2 = 0xdead000000000200
+ * These fail vmscan_is_kptr() (< 0xffff...) but are a definitive indicator
+ * of a module that was removed via list_del() — i.e. DKOM-hidden.
+ * Accept them explicitly so we don't filter out DKOM victims.
+ */
+#define MODSCAN_POISON1  0xdead000000000100UL
+#define MODSCAN_POISON2  0xdead000000000200UL
+
+static inline bool vmscan_is_poison(unsigned long p)
+{
+	return p == MODSCAN_POISON1 || p == MODSCAN_POISON2;
+}
+
 struct modscan_cand {
-	unsigned long addr;
+	unsigned long addr;   /* exact virtual address of struct module */
 	u32           state;
+	u8            dkom_poisoned; /* list pointers were LIST_POISON — DKOM */
 	char          name[MODULE_NAME_LEN + 1];
 };
 
 static void modscan_raw_scan(struct seq_file *m)
 {
 	struct modscan_cand *cands;
-	int ncands = 0, n_visible = 0, hidden = 0;
+	u8                  *page_buf;
+	int  ncands = 0, n_visible = 0, hidden = 0, mapped_pages = 0;
 	unsigned long addr;
 
 #ifndef MODULES_VADDR
@@ -472,58 +513,95 @@ static void modscan_raw_scan(struct seq_file *m)
 	const unsigned long raw_start = MODULES_VADDR;
 	const unsigned long raw_end   = MODULES_END;
 
-	seq_printf(m, "  Raw scan: 0x%lx – 0x%lx  (%lu pages)\n\n",
+	seq_printf(m,
+		   "  Raw scan (sliding window): 0x%lx – 0x%lx  (%lu pages)\n\n",
 		   raw_start, raw_end,
 		   (raw_end - raw_start) >> PAGE_SHIFT);
 
 	cands = kmalloc_array(MODSCAN_MAX_CANDS, sizeof(*cands), GFP_KERNEL);
 	if (!cands) {
-		seq_puts(m, "  OOM — cannot allocate candidate buffer\n");
+		seq_puts(m, "  OOM — cands\n");
 		return;
 	}
 
 	/*
-	 * Phase 1 — raw page probe (no lock needed).
-	 *
-	 * For each page: read the first 80 bytes with fault-safe accessor.
-	 * Unmapped pages return -EFAULT and are skipped instantly.
-	 * Mapped pages have their first 80 bytes checked against the
-	 * struct module signature (5-stage filter).
+	 * Allocate one page buffer on the heap (4 KB on kernel stack is too
+	 * risky — default stack is 8–16 KB and we have call-chain depth here).
 	 */
+	page_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!page_buf) {
+		seq_puts(m, "  OOM — page_buf\n");
+		kfree(cands);
+		return;
+	}
+
+	/* ── Phase 1: raw page scan, no lock ─────────────────────────────── */
 	for (addr = raw_start;
 	     addr < raw_end && ncands < MODSCAN_MAX_CANDS;
 	     addr += PAGE_SIZE) {
 
-		u8  buf[80];          /* covers state(4)+pad(4)+list(16)+name(56) */
-		u32 state;
-		unsigned long lnext, lprev;
-		char name[MODULE_NAME_LEN + 1];
+		unsigned int off;
 
-		/* One fault-safe read for the whole signature block */
-		if (vmscan_read(buf, (void *)addr, sizeof(buf)))
+		/*
+		 * Read the entire page at once.
+		 * Unmapped pages fault immediately — cheap.
+		 * Mapped pages give us 4096 bytes to slide over.
+		 */
+		if (vmscan_read(page_buf, (void *)addr, PAGE_SIZE))
 			continue;
 
-		/* [1] state: 0–MODULE_STATE_UNFORMED */
-		memcpy(&state, buf + 0, 4);
-		if (state > MODULE_STATE_UNFORMED)
-			continue;
+		mapped_pages++;
 
-		/* [2] list.next / list.prev: valid kernel pointer, 8B-aligned */
-		memcpy(&lnext, buf + 8,  8);
-		memcpy(&lprev, buf + 16, 8);
-		if (!vmscan_is_kptr(lnext) || !vmscan_is_kptr(lprev))
-			continue;
+		/*
+		 * Slide an 80-byte window at 8-byte steps.
+		 * 80 bytes covers: state(4)+pad(4)+list.next(8)+list.prev(8)+name(56).
+		 * The window must fit entirely within the page.
+		 */
+		for (off = 0; off + 80 <= (unsigned int)PAGE_SIZE; off += 8) {
 
-		/* [3] name[56]: printable ASCII, non-empty, NUL-terminated */
-		memcpy(name, buf + 24, MODULE_NAME_LEN);
-		name[MODULE_NAME_LEN] = '\0';
-		{
-			char c0 = name[0];
-			int i, nlen = -1;
+			u32           state;
+			unsigned long lnext, lprev;
+			char          name[MODULE_NAME_LEN + 1];
+			int           i, nlen;
+			char          c0;
+			bool          is_dkom;
+
+			/* ── Filter [1]: state ∈ {0,1,2,3} ────────────────── */
+			memcpy(&state, page_buf + off + 0, 4);
+			if (state > MODULE_STATE_UNFORMED)
+				continue;
+
+			/* ── Filter [2]: name[0] is alphanumeric/_ ─────────── *
+			 * Cheap early exit — avoids pointer reads for most windows.
+			 */
+			c0 = (char)page_buf[off + 24];
 			if (!((c0 >= 'a' && c0 <= 'z') ||
 			      (c0 >= 'A' && c0 <= 'Z') ||
 			      (c0 >= '0' && c0 <= '9') || c0 == '_'))
 				continue;
+
+			/* ── Filter [3]: list.next / list.prev ─────────────── *
+			 * Accept either:
+			 *   (a) canonical kernel pointer — module still in list,
+			 *   (b) LIST_POISON1/2 — module removed via list_del().
+			 * LIST_POISON is 0xdead000000000100/200: fails vmscan_is_kptr
+			 * (< 0xffff...) but is definitive evidence of DKOM hiding.
+			 * Any other value (NULL, arbitrary garbage) is rejected.
+			 */
+			memcpy(&lnext, page_buf + off + 8,  8);
+			memcpy(&lprev, page_buf + off + 16, 8);
+			if (!vmscan_is_kptr(lnext) && !vmscan_is_poison(lnext))
+				continue;
+			if (!vmscan_is_kptr(lprev) && !vmscan_is_poison(lprev))
+				continue;
+
+			/* True when list_del() poisoned the module's list ptrs */
+			is_dkom = vmscan_is_poison(lnext) || vmscan_is_poison(lprev);
+
+			/* ── Filter [4]: full name validation ──────────────── */
+			memcpy(name, page_buf + off + 24, MODULE_NAME_LEN);
+			name[MODULE_NAME_LEN] = '\0';
+			nlen = -1;
 			for (i = 0; i < MODULE_NAME_LEN; i++) {
 				if (name[i] == '\0') { nlen = i; break; }
 				if ((unsigned char)name[i] < 0x20 ||
@@ -532,37 +610,56 @@ static void modscan_raw_scan(struct seq_file *m)
 			}
 			if (nlen <= 0)
 				continue;
-		}
 
-		/* [4] Chain cross-check: *(list.next - 8) must also be valid state */
-		{
-			u32 ns = 0xff;
-			if (vmscan_read(&ns, (void *)(lnext - 8), 4) ||
-			    ns > MODULE_STATE_UNFORMED)
-				continue;
-		}
+			/* ── Filter [5]: chain cross-check ─────────────────── *
+			 * For live-list modules: walk to the neighbour struct
+			 * and verify its state — catches false positives from
+			 * data that happens to look like a module header.
+			 *
+			 * For DKOM-poisoned modules: skip — reading from POISON
+			 * addresses would fault.  The POISON values ARE the proof.
+			 */
+			if (!is_dkom) {
+				u32 ns = 0xff, ps = 0xff;
 
-		/* [5] Symmetry check: *(list.prev - 8) must also be valid state */
-		{
-			u32 ps = 0xff;
-			if (vmscan_read(&ps, (void *)(lprev - 8), 4) ||
-			    ps > MODULE_STATE_UNFORMED)
-				continue;
-		}
+				if (vmscan_read(&ns, (void *)(lnext - 8), 4) ||
+				    ns > MODULE_STATE_UNFORMED)
+					continue;
+				if (vmscan_read(&ps, (void *)(lprev - 8), 4) ||
+				    ps > MODULE_STATE_UNFORMED)
+					continue;
+			}
 
-		/* All five checks passed — record as candidate */
-		cands[ncands].addr  = addr;
-		cands[ncands].state = state;
-		memcpy(cands[ncands].name, name, MODULE_NAME_LEN + 1);
-		ncands++;
+			/* ── Deduplication: skip if same name already found ── */
+			{
+				int dup = 0, k;
+
+				for (k = 0; k < ncands; k++) {
+					if (strncmp(cands[k].name, name,
+						    MODULE_NAME_LEN) == 0) {
+						dup = 1;
+						break;
+					}
+				}
+				if (dup)
+					continue;
+			}
+
+			/* ── Record candidate ───────────────────────────────── */
+			if (ncands < MODSCAN_MAX_CANDS) {
+				cands[ncands].addr         = addr + off;
+				cands[ncands].state        = state;
+				cands[ncands].dkom_poisoned = is_dkom ? 1 : 0;
+				memcpy(cands[ncands].name, name,
+				       MODULE_NAME_LEN + 1);
+				ncands++;
+			}
+		}
 	}
 
-	/*
-	 * Phase 2 — compare candidates against modules list (brief mutex hold).
-	 *
-	 * We hold module_mutex only for the list walk, not during the scan,
-	 * so rmmod/insmod are blocked for milliseconds at most.
-	 */
+	kfree(page_buf);
+
+	/* ── Phase 2: compare against modules list (brief mutex hold) ─────── */
 	if (ncands > 0) {
 		if (mutex_lock_killable(&module_mutex) == 0) {
 			int i;
@@ -571,30 +668,33 @@ static void modscan_raw_scan(struct seq_file *m)
 					n_visible++;
 				} else {
 					seq_printf(m,
-						"RAW-HIDDEN   %-20s"
-						"  @ 0x%lx  state=%u\n",
-						cands[i].name,
-						cands[i].addr,
-						cands[i].state);
+						   "RAW-HIDDEN   %-20s"
+						   "  @ 0x%lx  state=%u%s\n",
+						   cands[i].name,
+						   cands[i].addr,
+						   cands[i].state,
+						   cands[i].dkom_poisoned
+						   ? "  [LIST_POISON -- DKOM via list_del]"
+						   : "");
 					hidden++;
 				}
 			}
 			mutex_unlock(&module_mutex);
 		} else {
-			seq_puts(m, "  (interrupted — could not acquire module_mutex)\n");
+			seq_puts(m, "  (interrupted — module_mutex unavailable)\n");
 		}
 	}
 
 	kfree(cands);
 
 	seq_printf(m,
-		   "  Result: %d module signatures found"
+		   "  Mapped pages: %d | Signatures found: %d"
 		   " (%d visible, %d HIDDEN)\n",
-		   ncands, n_visible, hidden);
-	if (ncands == 0)
-		seq_puts(m, "  (no mapped pages found in module range"
-			    " — probe_kernel_read may lack vmalloc access)\n");
-	else if (hidden == 0)
+		   mapped_pages, ncands, n_visible, hidden);
+	if (mapped_pages == 0)
+		seq_puts(m, "  NOTE: No mapped pages — rebuild modscan.ko for"
+			    " this kernel version\n");
+	else if (hidden == 0 && ncands > 0)
 		seq_puts(m, "  (all found modules are in the modules list)\n");
 #endif /* MODULES_VADDR */
 }
