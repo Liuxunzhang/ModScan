@@ -9,8 +9,10 @@
 #   3. /proc/kallsyms 孤儿模块符号（被隐藏的模块仍有符号残留）
 #   4. finit_module / init_module / load_module / tcp4_seq_show 等内联 patch 检测（需要 /proc/kcore）
 #   5. 系统调用表指针劫持检测，含 getdents/getdents64（需要 /proc/kcore）
-#   6. sig_enforce 状态
-#   7. Skidmap 恶意软件特征（已知模块名、ld.so.preload、PAM 后门、cron 持久化）
+#   6. kset/sysfs 四维交叉验证（含 stat 绕过 getdents64 hook，检测 Skidmap 文件隐藏）
+#   7. /proc/vmallocinfo 模块内存分配交叉验证（独立于所有链表追踪结构）
+#   8. sig_enforce 状态
+#   9. Skidmap 恶意软件特征（已知模块名、ld.so.preload、PAM 后门、cron 持久化）
 #
 # 用法: sudo bash modscan_scan.sh
 #
@@ -413,7 +415,7 @@ PYEOF
 #   offset 48 : kernfs_node *sd   — sysfs 节点指针（NULL = sysfs 已被删除）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_kset_sysfs() {
-    info "CHECK 6: module_kset / sysfs / proc 三源完整性交叉验证（via /proc/kcore）"
+    info "CHECK 6: module_kset / sysfs / proc 四维完整性交叉验证（via /proc/kcore）"
 
     if [[ ! -r /proc/kcore ]]; then
         warn "  /proc/kcore 不可读——跳过 kset/sysfs 交叉验证"
@@ -431,7 +433,6 @@ import struct, sys, os
 KCORE = "/proc/kcore"
 KSYMS = "/proc/kallsyms"
 
-# ── 读取 kallsyms ────────────────────────────────────────────────────────────
 syms = {}
 try:
     with open(KSYMS) as f:
@@ -446,7 +447,6 @@ except PermissionError:
 def sym(name):
     return syms.get(name, 0)
 
-# ── /proc/kcore ELF 读取器（复用 CHECK 4+5 的同款实现）────────────────────
 class KCore:
     def __init__(self, path):
         self.f = open(path, "rb")
@@ -459,13 +459,12 @@ class KCore:
         e_phnum     = struct.unpack_from('<H', hdr, 56)[0]
         for i in range(e_phnum):
             ph = self._pread(e_phoff + i * e_phentsize, 56)
-            p_type = struct.unpack_from('<I', ph, 0)[0]
-            if p_type != 1:
+            if struct.unpack_from('<I', ph, 0)[0] != 1:
                 continue
             self.segs.append((
-                struct.unpack_from('<Q', ph, 16)[0],   # p_vaddr
-                struct.unpack_from('<Q', ph, 32)[0],   # p_filesz
-                struct.unpack_from('<Q', ph, 8)[0],    # p_offset
+                struct.unpack_from('<Q', ph, 16)[0],
+                struct.unpack_from('<Q', ph, 32)[0],
+                struct.unpack_from('<Q', ph, 8)[0],
             ))
 
     def _pread(self, offset, n):
@@ -489,20 +488,10 @@ except Exception as e:
     print(f"  [!] 无法打开 /proc/kcore: {e}", file=sys.stderr)
     sys.exit(2)
 
-# ── 遍历 module_kset->list ────────────────────────────────────────────────────
-#
-# struct kobject 偏移（x86-64，Linux 4.x~6.x）:
-#   +0  : const char *name    (指向名字字符串的指针)
-#   +8  : list_head  entry    (kset 链表节点, next@+8, prev@+16)
-#   +48 : kernfs_node *sd     (sysfs 节点，NULL = sysfs 已删除)
-#
-# module_kset 是 static struct kset * 变量；kallsyms 给出指针变量地址，
-# 需额外一次解引用才得到实际 kset。
-# kset->list 是偏移 0 处的 list_head（sentinel）。
-#
-KOBJ_NAME_OFF = 0
+# ── 遍历 module_kset->list ───────────────────────────────────────────────────
+KOBJ_NAME_OFF  = 0
 KOBJ_ENTRY_OFF = 8
-KOBJ_SD_OFF   = 48
+KOBJ_SD_OFF    = 48
 
 kset_var = sym('module_kset')
 if not kset_var:
@@ -514,17 +503,17 @@ if not kset_ptr:
     print("  [!] 无法读取 module_kset 指针")
     sys.exit(2)
 
-sentinel = kset_ptr          # &kset->list
-cur = kc.read_u64(sentinel)  # kset->list.next = 第一个 kobject 的 entry 地址
+sentinel = kset_ptr
+cur = kc.read_u64(sentinel)
 if cur is None:
     print("  [!] 无法读取 kset->list.next")
     sys.exit(2)
 
-kset_names = {}   # name → (kobj_ptr, sd_ptr)
+kset_names = {}  # name → (kobj_ptr, sd_ptr)
 guard = 0
 while cur != sentinel and guard < 4096:
     guard += 1
-    kobj = cur - KOBJ_ENTRY_OFF  # 从 entry 字段退回 kobject 起始
+    kobj = cur - KOBJ_ENTRY_OFF
     name_ptr = kc.read_u64(kobj + KOBJ_NAME_OFF)
     if name_ptr:
         raw = kc.read(name_ptr, 56)
@@ -538,19 +527,22 @@ while cur != sentinel and guard < 4096:
         break
     cur = next_ptr
 
-print(f"    kcore kset 遍历结果: {len(kset_names)} 个模块 kobject")
-
-# ── 读取 /sys/module/ 列表 ───────────────────────────────────────────────────
-import os as _os
-sysfs_mods = set()
+# ── 两种方式枚举 /sys/module/ ─────────────────────────────────────────────────
+#
+# 方式1: scandir / readdir（经过 getdents64/getdents，可能被 rootkit 过滤）
+# 方式2: 对每个 kset 条目逐一 os.path.exists()（使用 newfstatat，不经过 getdents64）
+#
+# Skidmap 等 rootkit hook getdents64 来隐藏目录项，但不 hook newfstatat/stat64。
+# 因此：sysfs_via_stat 能看到 而 sysfs_via_readdir 看不到 → getdents64 被 hook！
+#
+sysfs_via_readdir = set()
 try:
-    for entry in _os.scandir('/sys/module'):
-        if entry.is_dir() and _os.path.exists(f'/sys/module/{entry.name}/initstate'):
-            sysfs_mods.add(entry.name)
+    for entry in os.scandir('/sys/module'):
+        if entry.is_dir() and os.path.exists(f'/sys/module/{entry.name}/initstate'):
+            sysfs_via_readdir.add(entry.name)
 except Exception as e:
-    print(f"  [!] 无法扫描 /sys/module/: {e}", file=sys.stderr)
+    print(f"  [!] 无法 scandir /sys/module/: {e}", file=sys.stderr)
 
-# ── 读取 /proc/modules 列表 ─────────────────────────────────────────────────
 proc_mods = set()
 try:
     with open('/proc/modules') as f:
@@ -559,40 +551,59 @@ try:
 except Exception as e:
     print(f"  [!] 无法读取 /proc/modules: {e}", file=sys.stderr)
 
-print(f"    /sys/module/ 视图  : {len(sysfs_mods)} 个 LKM")
-print(f"    /proc/modules 视图 : {len(proc_mods)} 个模块\n")
+print(f"    kcore kset 遍历结果          : {len(kset_names)} 个模块 kobject")
+print(f"    /sys/module/ readdir 视图    : {len(sysfs_via_readdir)} 个 LKM（可能被 hook 过滤）")
+print(f"    /proc/modules 视图           : {len(proc_mods)} 个模块\n")
 
 findings = 0
 
-# ── A: kcore kset 有，但 /sys/module/ 没有 ──────────────────────────────────
 for name, (kobj, sd) in kset_names.items():
-    if name not in sysfs_mods:
+    # 方式2: stat 探测（绕过 getdents64）
+    sysfs_stat_ok = os.path.exists(f'/sys/module/{name}/initstate')
+    in_readdir    = name in sysfs_via_readdir
+    in_proc       = name in proc_mods
+
+    if sysfs_stat_ok and not in_readdir:
+        # ── D: getdents64/getdents 被 hook！—— 这是 Skidmap 的核心隐藏手法 ──
         extra = ""
-        if name not in proc_mods:
-            extra = "（且不在 /proc/modules：高级双重 DKOM，kset 中仍有残留）"
-        print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中但 /sys/module/{name}/ 不存在！{extra}")
-        print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
-        print(f"            → sysfs 条目已被单独删除（kernfs_remove / kobject_del）")
-        findings += 1
-
-# ── B: kcore kset 中 sd==NULL（sysfs 节点已删除但 kobject 仍在 kset）────────
-for name, (kobj, sd) in kset_names.items():
-    if sd == 0 and name in sysfs_mods:
-        # sd is NULL but sysfs dir still visible — inconsistent state
-        print(f"\033[0;31m    [ALERT]\033[0m SD-NULL: '{name}' 的 kobject.sd == NULL，但 /sys/module/{name}/ 仍存在")
+        if not in_proc:
+            extra = "\n            → 且不在 /proc/modules（同时存在 DKOM）"
+        print(f"\033[0;31m    [ALERT]\033[0m GETDENTS-HOOK: '{name}'")
+        print(f"            /sys/module/{name}/initstate 通过 stat() 可访问 ✓")
+        print(f"            但 opendir(/sys/module)+readdir 看不到该目录项 ✗")
+        print(f"            → getdents64/getdents 系统调用被 HOOK，目录遍历结果被过滤！")
+        print(f"            → 这是 Skidmap 等 rootkit 隐藏内核模块目录的核心手段{extra}")
         print(f"            kobj地址: {kobj:#x}")
-        print(f"            → kernfs 节点已被 kobject_del() 清除，sysfs 目录残留（不一致状态）")
         findings += 1
 
-# ── C: /sys/module/ 有，但 kcore kset 没有 ──────────────────────────────────
-for name in sysfs_mods:
+    elif not sysfs_stat_ok and not in_readdir:
+        # ── A: sysfs 条目已被真正删除 ──
+        extra = ""
+        if not in_proc:
+            extra = "（高级双重 DKOM，kset 中仍有残留）"
+        print(f"\033[0;31m    [ALERT]\033[0m SYSFS-TAMPER: '{name}' 在 kcore kset 中，")
+        print(f"            但 stat 和 readdir 均无法访问 /sys/module/{name}/ {extra}")
+        print(f"            → sysfs 条目已被删除（kernfs_remove / kobject_del）")
+        print(f"            kobj地址: {kobj:#x}  sd指针: {sd:#x}")
+        findings += 1
+
+    elif sd == 0 and sysfs_stat_ok:
+        # ── B2: kobject.sd==NULL 但 sysfs 目录仍存在 —— 不一致状态 ──
+        print(f"\033[0;31m    [ALERT]\033[0m SD-NULL: '{name}' kobject.sd==NULL 但 /sys/module/{name}/ 可访问")
+        print(f"            → kernfs 节点指针已被清除，与 sysfs 实际状态不一致")
+        print(f"            kobj地址: {kobj:#x}")
+        findings += 1
+
+# ── C: readdir 看到的但 kcore kset 没有 ─────────────────────────────────────
+for name in sysfs_via_readdir:
     if name not in kset_names:
-        print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 存在，但不在 kcore kset 链表中！")
+        print(f"\033[0;31m    [ALERT]\033[0m KSET-TAMPER: '/sys/module/{name}/' 在 readdir 中可见，")
+        print(f"            但不在 kcore kset 链表中！")
         print(f"            → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留")
         findings += 1
 
 if findings == 0:
-    print("\033[0;32m    [+]\033[0m kset / sysfs / /proc/modules 三视图一致，未发现 kset/sysfs 篡改")
+    print("\033[0;32m    [+]\033[0m 四维一致（kcore kset / stat / readdir / /proc/modules）未发现篡改")
 
 sys.exit(1 if findings > 0 else 0)
 PYEOF
@@ -605,10 +616,114 @@ PYEOF
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CHECK 7: 模块签名强制检测
+# CHECK 7: /proc/vmallocinfo 模块内存分配交叉验证
+#
+# 原理：
+#   模块代码/数据通过 module_alloc()/load_module() 分配 vmalloc 内存，
+#   分配记录在 /proc/vmallocinfo 中，调用链包含 "load_module" 或 "module_alloc"。
+#   即使 rootkit 从 /proc/modules、kset、sysfs 中删除自身，其 vmalloc 内存
+#   分配通常仍残留在 /proc/vmallocinfo，因为 vmallocinfo 使用完全不同的代码路径，
+#   远比 /proc/modules 或 /sys/module/ 更难以同时伪造。
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+check_vmallocinfo() {
+    info "CHECK 7: /proc/vmallocinfo 模块内存分配交叉验证"
+
+    if [[ ! -r /proc/vmallocinfo ]]; then
+        warn "  /proc/vmallocinfo 不可读——跳过此项检测"
+        return
+    fi
+    if ! command -v python3 &>/dev/null; then
+        warn "  python3 未找到——跳过 vmallocinfo 检测"
+        return
+    fi
+
+    local py_ret=0
+    python3 - <<'PYEOF' || py_ret=$?
+import re, sys, os
+
+# ── 从 /proc/modules 构建已知模块地址范围 ────────────────────────────────────
+mod_ranges = {}  # name → (start, end)
+try:
+    with open('/proc/modules') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            name     = parts[0]
+            size     = int(parts[1])
+            addr_str = parts[-1].strip()
+            if addr_str.startswith('0x'):
+                addr = int(addr_str, 16)
+                if addr and size:
+                    mod_ranges[name] = (addr, addr + size)
+except Exception as e:
+    print(f"  [!] 无法读取 /proc/modules: {e}", file=sys.stderr)
+
+print(f"    /proc/modules 中已知 {len(mod_ranges)} 个模块地址范围")
+
+# ── 扫描 /proc/vmallocinfo ───────────────────────────────────────────────────
+# 格式: 0xSTART-0xEND  SIZE  CALLCHAIN...
+pat = re.compile(r'^0x([0-9a-f]+)-0x([0-9a-f]+)\s+(\d+)\s+(.*)', re.IGNORECASE)
+
+found = 0
+ghost = 0
+try:
+    with open('/proc/vmallocinfo') as f:
+        for line in f:
+            m = pat.match(line)
+            if not m:
+                continue
+            va_start = int(m.group(1), 16)
+            va_end   = int(m.group(2), 16)
+            va_size  = int(m.group(3))
+            info     = m.group(4).strip()
+
+            # 只关注由模块加载代码创建的分配
+            is_mod = ('load_module'    in info or
+                      'module_alloc'   in info or
+                      'move_module'    in info or
+                      'do_init_module' in info)
+            if not is_mod:
+                continue
+
+            found += 1
+
+            # 检查是否被已知模块地址范围覆盖（两段区间有重叠）
+            covered = any(
+                va_start < end and va_end > start
+                for (start, end) in mod_ranges.values()
+            )
+
+            if not covered:
+                print(f"\033[0;31m    [ALERT]\033[0m GHOST ALLOC: {va_start:#x}-{va_end:#x} ({va_size} 字节)")
+                print(f"            调用链: {info[:120]}")
+                print(f"            → vmalloc 由模块加载代码分配，但不被 /proc/modules 中任何模块覆盖！")
+                print(f"            → 这可能是已从所有追踪结构中删除自身的隐藏模块的代码/数据段")
+                ghost += 1
+
+except Exception as e:
+    print(f"  [!] 读取 /proc/vmallocinfo 出错: {e}", file=sys.stderr)
+    sys.exit(2)
+
+print(f"\n    共扫描 {found} 个模块 vmalloc 分配，其中 {ghost} 个无主")
+if ghost == 0:
+    print("\033[0;32m    [+]\033[0m 所有模块 vmalloc 分配均被已知模块覆盖")
+
+sys.exit(1 if ghost > 0 else 0)
+PYEOF
+
+    if [[ $py_ret -eq 1 ]]; then
+        flag
+    elif [[ $py_ret -eq 2 ]]; then
+        warn "  vmallocinfo 检测因错误中止"
+    fi
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHECK 8: 模块签名强制检测
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_sig_enforce() {
-    info "CHECK 7: 模块签名强制 (sig_enforce)"
+    info "CHECK 8: 模块签名强制 (sig_enforce)"
 
     local SIG=/proc/sys/kernel/sig_enforce
     if [[ ! -f "$SIG" ]]; then
@@ -638,7 +753,7 @@ check_sig_enforce() {
 #   - 在 cron 中写入持久化脚本
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 check_skidmap() {
-    info "CHECK 7: Skidmap 恶意软件特征检测"
+    info "CHECK 9: Skidmap 恶意软件特征检测"
 
     # ── 7-1. 已知 Skidmap 内核模块名扫描 ─────────────────────────────────────
     info "  [7-1] 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）"
@@ -776,6 +891,8 @@ echo
 check_hooks_via_kcore
 echo
 check_kset_sysfs
+echo
+check_vmallocinfo
 echo
 check_sig_enforce
 echo

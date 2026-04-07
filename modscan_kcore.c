@@ -718,72 +718,199 @@ next_entry:
 
 static void check_kset_sysfs_integrity(void)
 {
-    info("CHECK 5: module_kset / sysfs / proc 三源完整性交叉验证");
-    printf("  原理：直接通过 kcore 遍历内核内存中的 module_kset->list（比 /sys/module/ 更可信），\n"
-           "        与 /sys/module/ 和 /proc/modules 两个用户可见视图交叉比对，\n"
-           "        检测 kobject_del() 或 kernfs_remove() 单独篡改 sysfs 的高级 rootkit。\n\n");
+    info("CHECK 5: module_kset / sysfs / proc 四维完整性交叉验证");
+    printf("  新增：通过 stat() 逐一探测 /sys/module/<name>/ 路径，\n"
+           "        绕过 getdents64/getdents hook，检测 Skidmap 等通过\n"
+           "        劫持目录遍历系统调用隐藏文件的 rootkit。\n\n");
 
     kset_wlist_n = do_walk_kset();
     if (kset_wlist_n < 0) {
         warn("  kset 遍历失败，跳过此项检测");
         return;
     }
-    printf("    kcore kset 遍历结果: %d 个模块 kobject\n", kset_wlist_n);
-    printf("    /sys/module/ 视图  : %d 个 LKM\n",          sysfs_modlist_n);
-    printf("    /proc/modules 视图 : %d 个模块\n\n",         procmod_list_n);
+    printf("    kcore kset 遍历结果       : %d 个模块 kobject\n", kset_wlist_n);
+    printf("    /sys/module/ readdir 视图 : %d 个 LKM（可能被 getdents64 hook 过滤）\n",
+           sysfs_modlist_n);
+    printf("    /proc/modules 视图        : %d 个模块\n\n", procmod_list_n);
 
     int findings_before = g_findings;
 
-    /* ── A: kcore kset 有，但 /sys/module/ 没有 ─────────────────────────── */
-    /*    说明 sysfs 条目被单独删除：rootkit 调用了 kernfs_remove() 或          */
-    /*    kobject_del() 但没有从 modules 链表中摘除（或已从 modules 摘除但      */
-    /*    遗留了 kset 记录）。                                                   */
     for (int i = 0; i < kset_wlist_n; i++) {
-        if (!name_in_list(kset_wlist[i].name, sysfs_modlist, sysfs_modlist_n)) {
-            alert("  SYSFS-TAMPER: '%s' 存在于 kcore kset 链表，但 /sys/module/%s/ 不存在！",
-                  kset_wlist[i].name, kset_wlist[i].name);
-            printf("       kobj地址: %#lx\n",
-                   (unsigned long)kset_wlist[i].mod_addr);
-            printf("       → sysfs 条目已被单独删除（kernfs_remove / kobject_del）\n");
-            /* 检查是否也从 /proc/modules 中消失 */
-            if (!name_in_list(kset_wlist[i].name, procmod_list, procmod_list_n)) {
-                printf("       → 且不在 /proc/modules：已被双重隐藏（仅 kset 中残留）\n");
+        const char *name = kset_wlist[i].name;
+
+        /* ── 方法1: readdir（opendir+readdir，经过 getdents64）── */
+        bool via_readdir = name_in_list(name, sysfs_modlist, sysfs_modlist_n);
+
+        /* ── 方法2: stat（不经过 getdents64，使用 newfstatat 路径）── */
+        /*    即使 getdents64 被 hook 隐藏了目录项，stat 仍可能访问成功  */
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/module/%.56s/initstate", name);
+        bool via_stat = (access(path, F_OK) == 0);
+
+        bool in_proc = name_in_list(name, procmod_list, procmod_list_n);
+
+        /*
+         * 四种异常组合：
+         *
+         * D. via_stat=true  && via_readdir=false
+         *    → getdents64/getdents 被 hook，sysfs 条目真实存在但目录遍历被过滤
+         *    → 这是 Skidmap 通过 hook getdents64 隐藏自身的经典手法！
+         *
+         * A. via_stat=false && via_readdir=false（kset 有）
+         *    → sysfs 条目已被真正删除（kernfs_remove / kobject_del）
+         *
+         * B. via_stat=false && via_readdir=true（只 readdir 看到）
+         *    → kset 被直接篡改（list_del on kobj->entry），sysfs 残留
+         *
+         * C. in_proc=false && (via_stat 或 via_readdir) 可见
+         *    → 标准 DKOM：模块在 kset/sysfs 中但不在 modules 链表（已由 CHECK 2 报告）
+         */
+
+        if (via_stat && !via_readdir) {
+            /* ── D: getdents64 hook 检测 —— 最重要的新检测 ── */
+            alert("  GETDENTS-HOOK: '%s'", name);
+            printf("       /sys/module/%s/initstate 通过 stat() 可访问 ✓\n", name);
+            printf("       但 opendir(/sys/module/) + readdir 看不到该目录 ✗\n");
+            printf("       → getdents64/getdents 系统调用被 HOOK，目录遍历结果被过滤！\n");
+            printf("       → 这是 Skidmap 等 rootkit 隐藏内核模块的核心手段\n");
+            if (!in_proc) {
+                printf("       → 且不在 /proc/modules（同时存在 DKOM）\n");
             }
+            printf("       kobj地址: %#lx\n", (unsigned long)kset_wlist[i].mod_addr);
+            FINDING();
+        } else if (!via_stat && !via_readdir) {
+            /* ── A: sysfs 条目被真正删除 ── */
+            alert("  SYSFS-TAMPER: '%s' 在 kcore kset 中，但 sysfs 条目不存在（stat 和 readdir 均无）",
+                  name);
+            printf("       → sysfs 条目已被删除（kernfs_remove / kobject_del）\n");
+            if (!in_proc)
+                printf("       → 且不在 /proc/modules：高级双重 DKOM，kset 中仍有残留\n");
+            printf("       kobj地址: %#lx\n", (unsigned long)kset_wlist[i].mod_addr);
             FINDING();
         }
     }
 
-    /* ── B: /sys/module/ 有，但 kcore kset 没有 ─────────────────────────── */
-    /*    说明 kset 链表被直接篡改：rootkit 对 kobj->entry 调用了 list_del()   */
-    /*    但没有通过 kobject_del() 清理 sysfs（或这是正常 kernfs 虚拟节点）。   */
+    /* ── B: /sys/module/ readdir 有，但 kcore kset 没有 ────────────────── */
     for (int i = 0; i < sysfs_modlist_n; i++) {
         if (!name_in_list(sysfs_modlist[i].name, kset_wlist, kset_wlist_n)) {
-            alert("  KSET-TAMPER: '/sys/module/%s/' 存在，但不在 kcore kset 链表中！",
+            alert("  KSET-TAMPER: '/sys/module/%s/' 在 readdir 中可见，但不在 kcore kset 链表",
                   sysfs_modlist[i].name);
             printf("       → kset 链表节点被直接摘除（list_del on kobj->entry），sysfs 残留\n");
             FINDING();
         }
     }
 
-    /* ── C: kcore kset 有，但 /proc/modules 和 /sys/module/ 都没有 ─────── */
-    /*    最隐蔽的变种：rootkit 同时清理了 modules 链表和 sysfs，但 kset 中    */
-    /*    仍有残留，属于不完整的双重 DKOM。                                     */
-    for (int i = 0; i < kset_wlist_n; i++) {
-        bool in_sysfs = name_in_list(kset_wlist[i].name, sysfs_modlist, sysfs_modlist_n);
-        bool in_proc  = name_in_list(kset_wlist[i].name, procmod_list,  procmod_list_n);
-        if (!in_sysfs && !in_proc) {
-            alert("  FULLY-HIDDEN: '%s' 仅存于 kcore kset，/sys/module/ 和 /proc/modules 均无！",
-                  kset_wlist[i].name);
-            printf("       kobj地址: %#lx\n",
-                   (unsigned long)kset_wlist[i].mod_addr);
-            printf("       → 高级双重 DKOM：模块已从 sysfs 和 modules 链表中全部清除，\n");
-            printf("         但内存中的 kset 链表节点未被完全清理（rootkit 残留）\n");
-            FINDING();
+    if (g_findings == findings_before)
+        ok("  四维一致：kcore kset / stat / readdir / /proc/modules 均无篡改迹象");
+}
+
+/* ─── CHECK 6: /proc/vmallocinfo 模块内存分配交叉验证 ───────────────────── */
+/*
+ * 背景：
+ *   每个内核模块的代码/数据段通过 module_alloc()/load_module() 分配 vmalloc 内存，
+ *   这些分配记录在 /proc/vmallocinfo 中，其调用链包含 "load_module" 或 "module_alloc"。
+ *   即使 rootkit 从所有模块跟踪结构（modules 链表、kset、sysfs）中删除自身，
+ *   其 vmalloc 内存分配通常仍然存在于 /proc/vmallocinfo，
+ *   因为 vmallocinfo 直接读取内核的 vmalloc 元数据，使用不同的代码路径，
+ *   远比 /proc/modules 或 /sys/module/ 更难以同时伪造。
+ *
+ * 算法：
+ *   1. 从 /proc/modules 解析所有已知模块的地址范围
+ *   2. 解析 /proc/vmallocinfo 找到模块加载代码创建的 vmalloc 分配
+ *   3. 如果某个 vmalloc 分配不被任何已知模块的地址范围覆盖 → 可能是隐藏模块的内存
+ */
+static void check_vmalloc_modules(void)
+{
+    info("CHECK 6: /proc/vmallocinfo 模块内存分配交叉验证");
+    printf("  原理：即使模块从所有追踪结构中删除，其 vmalloc 代码段分配\n"
+           "        通常仍留在 /proc/vmallocinfo，因为其使用独立的内核代码路径。\n\n");
+
+    /* ── 1. 从 /proc/modules 构建已知模块地址范围 ─────────────────────── */
+    typedef struct { uint64_t start; uint64_t end; char name[MODULE_NAME_LEN]; } modrange_t;
+#define MAX_MODRANGES 512
+    static modrange_t modranges[MAX_MODRANGES];
+    int n_ranges = 0;
+
+    FILE *pf = fopen("/proc/modules", "r");
+    if (pf) {
+        char line[512];
+        while (fgets(line, sizeof(line), pf) && n_ranges < MAX_MODRANGES) {
+            char   mname[MODULE_NAME_LEN] = {0};
+            unsigned long msize = 0;
+            unsigned long long maddr = 0;
+            /* 格式: name size refcnt deps state address */
+            if (sscanf(line, "%55s %lu %*d %*s %*s %llx",
+                       mname, &msize, &maddr) == 3 && maddr && msize) {
+                strncpy(modranges[n_ranges].name, mname, MODULE_NAME_LEN - 1);
+                modranges[n_ranges].start = (uint64_t)maddr;
+                modranges[n_ranges].end   = (uint64_t)maddr + msize;
+                n_ranges++;
+            }
         }
+        fclose(pf);
     }
 
-    if (g_findings == findings_before)
-        ok("  kset / sysfs / /proc/modules 三视图一致，未发现篡改");
+    /* 也将 kcore kset 遍历中的模块名加入白名单（名字匹配） */
+    /* （kset 中的模块我们已知是合法的，即使 /proc/modules 被过滤也算白名单） */
+    printf("    /proc/modules 解析到 %d 个模块地址范围\n", n_ranges);
+    printf("    kcore kset 中已知 %d 个模块名（作为名字白名单）\n\n",
+           kset_wlist_n > 0 ? kset_wlist_n : 0);
+
+    /* ── 2. 扫描 /proc/vmallocinfo ────────────────────────────────────── */
+    FILE *vf = fopen("/proc/vmallocinfo", "r");
+    if (!vf) {
+        warn("  无法打开 /proc/vmallocinfo（CONFIG_PROC_FS 未启用？）");
+        return;
+    }
+
+    int found = 0, ghost = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), vf)) {
+        unsigned long long va_start = 0, va_end = 0;
+        unsigned long va_size = 0;
+        char info[256] = {0};
+
+        /* 格式: 0xSTART-0xEND  SIZE  CALLCHAIN... */
+        if (sscanf(line, "%llx-%llx %lu %255[^\n]",
+                   &va_start, &va_end, &va_size, info) < 3)
+            continue;
+
+        /* 只关注由模块加载代码创建的分配 */
+        bool is_mod = strstr(info, "load_module")    != NULL ||
+                      strstr(info, "module_alloc")   != NULL ||
+                      strstr(info, "move_module")    != NULL ||
+                      strstr(info, "do_init_module") != NULL;
+        if (!is_mod)
+            continue;
+
+        found++;
+
+        /* 检查该分配是否被已知模块的地址范围覆盖（允许小幅 offset 误差） */
+        bool covered = false;
+        for (int i = 0; i < n_ranges && !covered; i++) {
+            /* 地址范围重叠：两段区间有交集 */
+            if ((uint64_t)va_start < modranges[i].end &&
+                (uint64_t)va_end   > modranges[i].start)
+                covered = true;
+        }
+
+        if (!covered) {
+            /* 用 kset 名字做二次验证：如果 kset 里有这个地址范围的模块，降级为警告 */
+            /* （kset 遍历只有名字，没有地址，所以这里仅做数量提示）        */
+            alert("  GHOST ALLOC: %#llx-%#llx (%lu 字节) 模块内存分配无主！",
+                  va_start, va_end, va_size);
+            printf("       调用链: %.120s\n", info);
+            printf("       → vmalloc 由模块加载代码分配，但不被 /proc/modules 中任何模块覆盖\n");
+            printf("       → 可能是已从所有追踪结构中删除自身的隐藏模块的代码/数据段\n");
+            FINDING();
+            ghost++;
+        }
+    }
+    fclose(vf);
+
+    printf("    共扫描 %d 个模块 vmalloc 分配，其中 %d 个无主\n", found, ghost);
+    if (ghost == 0)
+        ok("  所有模块 vmalloc 分配均有对应的已知模块");
 }
 
 /* ─── CHECK 7: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
@@ -1019,7 +1146,8 @@ int main(void)
     check_hidden_modules();    printf("\n");
 
     if (kcore_fd >= 0) {
-        check_kset_sysfs_integrity(); printf("\n");   /* 新增：kset/sysfs 交叉验证 */
+        check_kset_sysfs_integrity(); printf("\n");
+        check_vmalloc_modules();      printf("\n");
         check_function_integrity();   printf("\n");
         check_syscall_table();        printf("\n");
     }
