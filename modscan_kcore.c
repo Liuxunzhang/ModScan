@@ -12,6 +12,7 @@
  *   4. 系统调用表指针劫持 (sys_call_table[313/175/78/217])
  *   5. Skidmap 恶意软件特征（已知模块名、getdents64 hook、PAM 后门、ld.so.preload）
  *   6. kset/sysfs 完整性交叉验证
+ *   7. struct module 内存特征扫描（Volatility 3 方法，扫描 vmalloc 区域寻找被 DKOM 隐藏的模块）
  *      ─ 直接通过 kcore 遍历 module_kset->list（内存可信源），与 /sys/module/ 和
  *        /proc/modules 交叉比对，检测 kobject_del 或 kernfs_remove 篡改 sysfs 的高级 rootkit
  *
@@ -913,7 +914,158 @@ static void check_vmalloc_modules(void)
         ok("  所有模块 vmalloc 分配均有对应的已知模块");
 }
 
-/* ─── CHECK 7: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
+/* ─── CHECK 7: struct module 内存特征扫描（Volatility 3 方法）──────────── */
+/*
+ * 原理：
+ *   rootkit 通过 list_del(&mod->list) 将自身从 modules 链表摘除后，
+ *   其 struct module 对象和模块代码段依然存在于 vmalloc 内存中——
+ *   只要模块仍在运行，就不能释放自身的内存，否则代码段将无法执行。
+ *
+ *   通过扫描 /proc/vmallocinfo 中由模块加载代码（load_module/module_alloc）
+ *   分配的所有 vmalloc 区域，对每块区域读取开头字节，寻找符合
+ *   struct module 布局特征的内存模式，即可发现被 DKOM 隐藏的模块。
+ *   这正是 Volatility 3 隐藏模块检测插件（linux.hidden_modules）的核心思路。
+ *
+ * struct module 特征签名（x86-64，offset 稳定）：
+ *   +0  state  (4B)  : 值必须为 0/1/2/3（MODULE_STATE_LIVE/COMING/GOING/UNFORMED）
+ *   +8  list.next(8B): 有效内核地址（>= 0xffff000000000000，8 字节对齐，非零）
+ *   +16 list.prev(8B): 同上
+ *   +24 name[56]     : 可打印 ASCII 字符串，首字符为字母/数字/下划线，有 \0 终止
+ *
+ * 额外验证：
+ *   读取 list.next - 8 处的 state 字段，验证链表指针确实指向另一个合法的
+ *   struct module（或哨兵头节点），进一步排除偶然的签名碰撞。
+ */
+static void check_struct_module_scan(void)
+{
+    info("CHECK 7: struct module 内存特征扫描（Volatility 3 方法）");
+    printf("  原理：扫描 vmalloc 区域寻找 struct module 内存签名——\n"
+           "        即使模块已从所有链表中摘除，其内存对象仍存在。\n\n");
+
+    if (kcore_fd < 0) {
+        warn("  /proc/kcore 不可用，跳过内存扫描");
+        return;
+    }
+
+    FILE *vf = fopen("/proc/vmallocinfo", "r");
+    if (!vf) {
+        warn("  无法打开 /proc/vmallocinfo（CONFIG_PROC_FS 未启用？）");
+        return;
+    }
+
+    /* struct module 特征扫描所需的最小字节数：state(4)+pad(4)+next(8)+prev(8)+name(56) */
+#define MOD_SIG_BYTES 80
+
+    int scanned = 0, candidates = 0, hidden = 0;
+    char line[512];
+
+    while (fgets(line, sizeof(line), vf)) {
+        unsigned long long va_start = 0, va_end = 0;
+        unsigned long va_size = 0;
+        char call_info[256] = {0};
+
+        if (sscanf(line, "%llx-%llx %lu %255[^\n]",
+                   &va_start, &va_end, &va_size, call_info) < 3)
+            continue;
+
+        /* 只检查由模块加载代码分配的区域 */
+        bool is_mod_alloc = strstr(call_info, "load_module")    != NULL ||
+                            strstr(call_info, "module_alloc")   != NULL ||
+                            strstr(call_info, "move_module")    != NULL ||
+                            strstr(call_info, "do_init_module") != NULL;
+        if (!is_mod_alloc)
+            continue;
+
+        /* 太小的区域不可能容纳 struct module 头 */
+        if (va_size < MOD_SIG_BYTES)
+            continue;
+
+        scanned++;
+
+        /* ── 读取区域开头 MOD_SIG_BYTES 字节 ────────────────────────────── */
+        uint8_t buf[MOD_SIG_BYTES];
+        if (kcore_read((uint64_t)va_start, buf, MOD_SIG_BYTES) != MOD_SIG_BYTES)
+            continue;
+
+        /* ── 验证 state 字段（offset 0，4 字节）────────────────────────── */
+        uint32_t state;
+        memcpy(&state, buf + 0, 4);
+        if (state > 3)
+            continue;   /* 非法的 module_state 值 */
+
+        /* ── 验证 list.next / list.prev（offset 8/16，各 8 字节）─────────── */
+        uint64_t list_next, list_prev;
+        memcpy(&list_next, buf + 8,  8);
+        memcpy(&list_prev, buf + 16, 8);
+
+        /* 有效内核地址：高位为 1（>= 0xffff000000000000），8 字节对齐，非零 */
+#define IS_KADDR(p) ((p) != 0 && ((p) & 7) == 0 && (p) >= 0xffff000000000000ULL)
+        if (!IS_KADDR(list_next) || !IS_KADDR(list_prev))
+            continue;
+
+        /* ── 验证 name 字段（offset 24，56 字节）───────────────────────── */
+        char name[MODULE_NAME_LEN + 1];
+        memcpy(name, buf + 24, MODULE_NAME_LEN);
+        name[MODULE_NAME_LEN] = '\0';
+
+        /* 首字符必须是字母/数字/下划线 */
+        char c0 = name[0];
+        bool first_ok = (c0 >= 'a' && c0 <= 'z') ||
+                        (c0 >= 'A' && c0 <= 'Z') ||
+                        (c0 >= '0' && c0 <= '9') ||
+                        c0 == '_';
+        if (!first_ok)
+            continue;
+
+        /* 所有字符必须是可打印 ASCII，且在 56 字节内有 null 终止符 */
+        int name_len = -1;
+        for (int i = 0; i < MODULE_NAME_LEN; i++) {
+            if (name[i] == '\0') { name_len = i; break; }
+            if ((uint8_t)name[i] < 0x20 || (uint8_t)name[i] >= 0x7f) {
+                name_len = -1;
+                break;
+            }
+        }
+        if (name_len <= 0)
+            continue;   /* 未找到 null 终止符，或名称为空，或含不可打印字符 */
+
+        /* ── 额外验证：list.next - 8 处的 state 字段应合法 ─────────────── */
+        /* list.next 指向下一个 struct module 的 list 字段（offset 8）        */
+        /* 因此下一个 struct module 起始 = list.next - 8                      */
+        uint32_t next_state = 0xff;
+        uint64_t next_mod   = list_next - 8;
+        if (kcore_read(next_mod, &next_state, 4) != 4 || next_state > 3)
+            continue;   /* 链表指针未指向有效的 struct module 或哨兵节点 */
+
+        /* ── 候选确认 ───────────────────────────────────────────────────── */
+        candidates++;
+
+        bool in_proc = name_in_list(name, procmod_list, procmod_list_n);
+
+        if (!in_proc) {
+            alert("  HIDDEN MODULE (内存扫描): '%s'", name);
+            printf("       vmalloc 区域 : %#llx – %#llx  (%lu 字节)\n",
+                   va_start, va_end, va_size);
+            printf("       state        : %u\n", state);
+            printf("       list.next    : %#lx\n", (unsigned long)list_next);
+            printf("       list.prev    : %#lx\n", (unsigned long)list_prev);
+            printf("       → struct module 签名完整匹配，但该模块不在 /proc/modules\n");
+            printf("       → 该模块很可能执行了 list_del(&mod->list) 将自身从链表摘除\n");
+            printf("       → 这是 DKOM 隐藏的直接内存证据（Volatility 3 扫描方法）\n");
+            FINDING();
+            hidden++;
+        }
+        /* 正常模块（in_proc）不报告，避免噪声 */
+    }
+    fclose(vf);
+
+    printf("    共扫描 %d 个模块 vmalloc 区域，发现 %d 个有效 struct module，"
+           "其中 %d 个不在 /proc/modules\n", scanned, candidates, hidden);
+    if (hidden == 0)
+        ok("  未通过内存扫描发现隐藏模块");
+}
+
+/* ─── CHECK 8: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
 /*
  * Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，其内核模块通过以下手段隐藏：
  *   - 劫持 getdents64 系统调用（已在 CHECK 4 中检测）
@@ -924,7 +1076,7 @@ static void check_vmalloc_modules(void)
  */
 static void check_skidmap_indicators(void)
 {
-    info("CHECK 7: Skidmap 恶意软件特征检测");
+    info("CHECK 8: Skidmap 恶意软件特征检测");
 
     /* ── 1. 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）────────────── */
     printf("  [1] 已知 Skidmap 内核模块名扫描\n");
@@ -1150,6 +1302,7 @@ int main(void)
         check_vmalloc_modules();      printf("\n");
         check_function_integrity();   printf("\n");
         check_syscall_table();        printf("\n");
+        check_struct_module_scan();   printf("\n");
     }
 
     check_skidmap_indicators(); printf("\n");
