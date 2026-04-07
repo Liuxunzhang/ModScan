@@ -15,6 +15,9 @@
  *   7. struct module 内存特征扫描（Volatility 3 方法，扫描 vmalloc 区域寻找被 DKOM 隐藏的模块）
  *      ─ 直接通过 kcore 遍历 module_kset->list（内存可信源），与 /sys/module/ 和
  *        /proc/modules 交叉比对，检测 kobject_del 或 kernfs_remove 篡改 sysfs 的高级 rootkit
+ *   9. vmap_area_list 直接内存扫描（Volatility 3 精确复现）
+ *      ─ 绕过 /proc/vmallocinfo，直接读取内核 vmap_area_list 链表，
+ *        枚举所有 VM_ALLOC 区域，扫描 struct module 签名，与 Vol3 linux.hidden_modules 完全等价
  *
  * struct module 布局（x86-64，无 __randomize_layout，跨内核版本稳定）：
  *   offset  0: enum module_state state   (4 bytes)
@@ -1121,6 +1124,195 @@ static void check_struct_module_scan(void)
         ok("  未通过内存扫描发现隐藏模块");
 }
 
+/* ─── CHECK 9: vmap_area_list 直接内存扫描（Volatility 3 精确复现）────────
+ *
+ * Volatility 3 linux.hidden_modules 插件的核心原理：
+ * 遍历内核 vmap_area_list 全局链表（存储所有 vmalloc 分配的元数据），
+ * 对每个 VM_ALLOC 类型区域扫描 struct module 签名。
+ *
+ * 与 CHECK 6/7 的本质区别：
+ *   CHECK 6/7 : 依赖 /proc/vmallocinfo（内核生成文件，可被 rootkit hook）
+ *   CHECK 9   : 直接从 kcore 读取 vmap_area_list 内核数据结构，
+ *               绕过 /proc 文件系统及其可能存在的所有钩子。
+ *
+ * struct vmap_area 布局（x86-64，Linux 5.x–6.x，无 __randomize_layout）：
+ *   +0   va_start           (8B) — vmalloc 区域起始虚拟地址
+ *   +8   va_end             (8B) — vmalloc 区域结束虚拟地址
+ *   +16  rb_node            (24B = 3×8B: __rb_parent_color/rb_right/rb_left)
+ *   +40  list.next          (8B) ← 链表遍历入口
+ *   +48  list.prev          (8B)
+ *   +56  vm (struct vm_struct*) 或 subtree_max_size（union）
+ *
+ * struct vm_struct 布局（x86-64）：
+ *   +0   next  (8B)
+ *   +8   addr  (8B) → 应与 va_start 相等
+ *   +16  size  (8B)
+ *   +24  flags (8B) → VM_ALLOC=0x1 表示 vmalloc/module 分配
+ */
+#define VMAP_AREA_LIST_OFF   40          /* list_head 在 struct vmap_area 中的偏移 */
+#define VMAP_AREA_VM_OFF     56          /* vm 指针在 struct vmap_area 中的偏移    */
+#define VM_STRUCT_ADDR_OFF    8          /* addr  在 struct vm_struct 中的偏移     */
+#define VM_STRUCT_FLAGS_OFF  24          /* flags 在 struct vm_struct 中的偏移     */
+#define VM_ALLOC_FLAG        0x00000001UL /* VM_ALLOC 标志位                       */
+
+static void check_vmap_area_list_scan(void)
+{
+    info("CHECK 9: vmap_area_list 直接内存扫描（Volatility 3 精确复现）");
+    printf("  原理：直接从 kcore 读取内核 vmap_area_list 全局链表，\n"
+           "        枚举所有 VM_ALLOC 区域并扫描 struct module 签名，\n"
+           "        完全绕过 /proc/vmallocinfo 及其可能的 rootkit 钩子。\n\n");
+
+    if (kcore_fd < 0) {
+        warn("  /proc/kcore 不可用，跳过");
+        return;
+    }
+
+    /* ── 1. 查找 vmap_area_list 符号 ─────────────────────────────────────── */
+    uint64_t vmal_head = sym_addr("vmap_area_list");
+    if (!vmal_head) {
+        warn("  vmap_area_list 不在 kallsyms（需要 CONFIG_KALLSYMS_ALL=y）");
+        warn("  → 已由 CHECK 7（/proc/vmallocinfo 过滤扫描）提供覆盖");
+        return;
+    }
+    printf("    vmap_area_list @ %#lx\n\n", (unsigned long)vmal_head);
+
+    /* ── 2. 读链表头 next 指针（list_head.next） ──────────────────────────── */
+    uint64_t cur;
+    if (!kcore_read_u64(vmal_head, &cur) || !IS_KADDR(cur)) {
+        warn("  无法读取 vmap_area_list.next，链表为空或 kcore 权限不足");
+        return;
+    }
+
+    int scanned = 0, vm_alloc_cnt = 0, candidates = 0, hidden = 0;
+
+    /* ── 3. 遍历 vmap_area_list 链表 ─────────────────────────────────────── */
+    while (cur != vmal_head && scanned < 300000) {
+        /*
+         * cur 指向 vmap_area.list 字段（偏移 +40），
+         * 减去偏移得到 struct vmap_area 的起始地址。
+         */
+        uint64_t va_addr = cur - VMAP_AREA_LIST_OFF;
+        scanned++;
+
+        /* 读 vmap_area 前 64 字节 */
+        uint8_t va_buf[64];
+        bool buf_ok = (kcore_read(va_addr, va_buf, sizeof(va_buf)) ==
+                       (ssize_t)sizeof(va_buf));
+
+        /*
+         * 先更新 cur（推进链表），再处理数据，
+         * 确保所有 continue 路径都能正确推进链表。
+         */
+        uint64_t list_next = 0;
+        if (buf_ok)
+            memcpy(&list_next, va_buf + 40, 8);          /* vmap_area.list.next */
+        else
+            kcore_read_u64(cur, &list_next);              /* 退路：直接读 cur+0  */
+
+        if (!IS_KADDR(list_next))
+            break;
+        cur = list_next;
+
+        if (!buf_ok)
+            continue;
+
+        uint64_t va_start, va_end, vm_ptr;
+        memcpy(&va_start, va_buf + 0,              8);
+        memcpy(&va_end,   va_buf + 8,              8);
+        memcpy(&vm_ptr,   va_buf + VMAP_AREA_VM_OFF, 8);
+
+        uint64_t va_size = va_end - va_start;
+
+        /* 大小过滤：太小（无法容纳 struct module）或太大（异常） */
+        if (va_size < MOD_SIG_BYTES || va_size > 256ULL * 1024 * 1024)
+            continue;
+
+        /* vm 指针必须有效（非 free/lazy-purge 的空闲区域） */
+        if (!IS_KADDR(vm_ptr))
+            continue;
+
+        /* ── 4. 读 vm_struct 验证：addr==va_start 且带 VM_ALLOC 标志 ──── */
+        uint64_t vm_addr_f = 0, vm_flags = 0;
+        if (!kcore_read_u64(vm_ptr + VM_STRUCT_ADDR_OFF,  &vm_addr_f) ||
+            !kcore_read_u64(vm_ptr + VM_STRUCT_FLAGS_OFF, &vm_flags))
+            continue;
+
+        /* vm->addr 应与 va_start 完全一致 */
+        if (vm_addr_f != va_start)
+            continue;
+
+        /* 必须是 VM_ALLOC 分配（内核模块、vmalloc 等），跳过 vmap/ioremap */
+        if (!(vm_flags & VM_ALLOC_FLAG))
+            continue;
+
+        vm_alloc_cnt++;
+
+        /* ── 5. struct module 签名匹配 ─────────────────────────────────── */
+        uint8_t buf[MOD_SIG_BYTES];
+        if (kcore_read(va_start, buf, MOD_SIG_BYTES) != MOD_SIG_BYTES)
+            continue;
+
+        /* state (offset 0, 4B): 合法值 0–3（LIVE/COMING/GOING/UNFORMED） */
+        uint32_t state;
+        memcpy(&state, buf + 0, 4);
+        if (state > 3)
+            continue;
+
+        /* list.next / list.prev (offset 8/16, 各 8B): 有效内核指针，8B 对齐 */
+        uint64_t mod_lnext, mod_lprev;
+        memcpy(&mod_lnext, buf + 8,  8);
+        memcpy(&mod_lprev, buf + 16, 8);
+        if (!IS_KADDR(mod_lnext) || !IS_KADDR(mod_lprev))
+            continue;
+
+        /* name (offset 24, 56B): 可打印 ASCII，首字符合法，必须有 null 终止 */
+        char name[MODULE_NAME_LEN + 1];
+        memcpy(name, buf + 24, MODULE_NAME_LEN);
+        name[MODULE_NAME_LEN] = '\0';
+        char c0 = name[0];
+        if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') ||
+              (c0 >= '0' && c0 <= '9') || c0 == '_'))
+            continue;
+        int nlen = -1;
+        for (int i = 0; i < MODULE_NAME_LEN; i++) {
+            if (name[i] == '\0') { nlen = i; break; }
+            if ((uint8_t)name[i] < 0x20 || (uint8_t)name[i] >= 0x7f) break;
+        }
+        if (nlen <= 0)
+            continue;
+
+        /* 链表交叉验证：mod_lnext - 8 处的 state 字段也应合法（0–3） */
+        uint32_t next_state = 0xff;
+        if (kcore_read(mod_lnext - 8, &next_state, 4) != 4 || next_state > 3)
+            continue;
+
+        candidates++;
+
+        /* ── 6. 与 /proc/modules 对比，报告隐藏模块 ────────────────────── */
+        bool in_proc = name_in_list(name, procmod_list, procmod_list_n);
+        if (!in_proc) {
+            alert("  HIDDEN MODULE (vmap_area_list 直接扫描): '%s'", name);
+            printf("       vmalloc 区域  : %#lx – %#lx (%lu 字节)\n",
+                   (unsigned long)va_start, (unsigned long)va_end,
+                   (unsigned long)va_size);
+            printf("       struct module : state=%u  list.next=%#lx\n",
+                   state, (unsigned long)mod_lnext);
+            printf("       vm_struct*    : %#lx  flags=%#lx (VM_ALLOC)\n",
+                   (unsigned long)vm_ptr, (unsigned long)vm_flags);
+            printf("       → 直接从内核 vmap_area_list 读取（绕过所有 /proc 钩子）\n"
+                   "       → 与 Volatility 3 linux.hidden_modules 完全相同的检测方法\n");
+            FINDING();
+            hidden++;
+        }
+    }
+
+    printf("    vmap_area 遍历: %d 条目，VM_ALLOC: %d 个，"
+           "struct module 候选: %d，隐藏: %d\n",
+           scanned, vm_alloc_cnt, candidates, hidden);
+    if (hidden == 0)
+        ok("  vmap_area_list 直接扫描：未发现隐藏模块");
+}
+
 /* ─── CHECK 8: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
 /*
  * Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，其内核模块通过以下手段隐藏：
@@ -1359,6 +1551,7 @@ int main(void)
         check_function_integrity();   printf("\n");
         check_syscall_table();        printf("\n");
         check_struct_module_scan();   printf("\n");
+        check_vmap_area_list_scan();  printf("\n");
     }
 
     check_skidmap_indicators(); printf("\n");
