@@ -1,1 +1,6 @@
 .claude
+modscan_kcore
+modscan_cli
+*.o
+*.ko
+*.mod.c
