@@ -896,15 +896,71 @@ static void check_vmalloc_modules(void)
         }
 
         if (!covered) {
-            /* 用 kset 名字做二次验证：如果 kset 里有这个地址范围的模块，降级为警告 */
-            /* （kset 遍历只有名字，没有地址，所以这里仅做数量提示）        */
-            alert("  GHOST ALLOC: %#llx-%#llx (%lu 字节) 模块内存分配无主！",
-                  va_start, va_end, va_size);
-            printf("       调用链: %.120s\n", info);
-            printf("       → vmalloc 由模块加载代码分配，但不被 /proc/modules 中任何模块覆盖\n");
-            printf("       → 可能是已从所有追踪结构中删除自身的隐藏模块的代码/数据段\n");
-            FINDING();
-            ghost++;
+            /*
+             * 辅助验证：读取该区域起始处，检查是否符合 struct module 签名。
+             * 辅助分配（per-CPU、jump table 等）不以 struct module 开头，
+             * 读出来的 state 字段会是乱码，从而过滤掉误报。
+             * 只有通过签名验证的区域才真正告警。
+             */
+            bool sig_ok = false;
+            if (va_size >= 80) {
+                uint8_t buf[80];
+                if (kcore_read((uint64_t)va_start, buf, sizeof(buf)) == 80) {
+                    uint32_t st;
+                    memcpy(&st, buf, 4);
+                    if (st <= 3) {
+                        uint64_t lnext, lprev;
+                        memcpy(&lnext, buf + 8,  8);
+                        memcpy(&lprev, buf + 16, 8);
+                        if (lnext && (lnext & 7) == 0 && lnext >= 0xffff000000000000ULL &&
+                            lprev && (lprev & 7) == 0 && lprev >= 0xffff000000000000ULL) {
+                            /* 检查 name 字段 */
+                            char nm[MODULE_NAME_LEN + 1];
+                            memcpy(nm, buf + 24, MODULE_NAME_LEN);
+                            nm[MODULE_NAME_LEN] = '\0';
+                            char c0 = nm[0];
+                            bool c0_ok = (c0 >= 'a' && c0 <= 'z') ||
+                                         (c0 >= 'A' && c0 <= 'Z') ||
+                                         (c0 >= '0' && c0 <= '9') ||
+                                         c0 == '_';
+                            if (c0_ok) {
+                                bool name_ok = false;
+                                for (int ni = 0; ni < MODULE_NAME_LEN; ni++) {
+                                    if (nm[ni] == '\0') { name_ok = true; break; }
+                                    if ((uint8_t)nm[ni] < 0x20 ||
+                                        (uint8_t)nm[ni] >= 0x7f) break;
+                                }
+                                /* 链表指针交叉验证：list.next-8 处的 state 也应合法 */
+                                if (name_ok) {
+                                    uint32_t nst = 0xff;
+                                    sig_ok = (kcore_read(lnext - 8, &nst, 4) == 4 &&
+                                              nst <= 3);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (sig_ok) {
+                /* 读出模块名用于告警输出 */
+                char hidden_name[MODULE_NAME_LEN + 1] = {0};
+                uint8_t nbuf[80];
+                if (kcore_read((uint64_t)va_start, nbuf, 80) == 80) {
+                    memcpy(hidden_name, nbuf + 24, MODULE_NAME_LEN);
+                    hidden_name[MODULE_NAME_LEN] = '\0';
+                }
+                alert("  GHOST ALLOC: %#llx-%#llx (%lu 字节) 疑似隐藏模块内存！",
+                      va_start, va_end, va_size);
+                if (hidden_name[0])
+                    printf("       模块名 (struct 扫描): %s\n", hidden_name);
+                printf("       调用链: %.120s\n", info);
+                printf("       → struct module 签名验证通过，但不在 /proc/modules\n");
+                printf("       → 该模块很可能通过 list_del 将自身从链表摘除\n");
+                FINDING();
+                ghost++;
+            }
+            /* sig_ok == false：辅助分配（per-CPU/jump table 等），忽略 */
         }
     }
     fclose(vf);
