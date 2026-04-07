@@ -81,6 +81,14 @@ static void alert(const char *fmt, ...) {
 static int g_findings = 0;
 #define FINDING() (g_findings++)
 
+/* ─── 内核版本（从 uname 解析，用于选择正确的 vmap_area 布局）────────────── */
+static int g_kern_major = 5, g_kern_minor = 7; /* 默认 5.7+ 布局 */
+
+static void parse_kernel_version(const char *release)
+{
+    sscanf(release, "%d.%d", &g_kern_major, &g_kern_minor);
+}
+
 /* ─── struct module 布局常量（x86-64，稳定跨版本）────────────────────────── */
 #define MODULE_STATE_OFF     0   /* enum module_state */
 #define MODULE_LIST_NEXT_OFF 8   /* list_head.next (list is at offset 8) */
@@ -1167,6 +1175,25 @@ static void check_vmap_area_list_scan(void)
         return;
     }
 
+    /* ── 根据内核版本选择 vmap_area 字段偏移 ─────────────────────────────── *
+     *
+     * Linux < 5.7  (+flags 字段在 rb_node 之前):
+     *   +0  va_start, +8 va_end, +16 flags(8B), +24 rb_node(24B)
+     *   +48 list.next ← va_list_off=48
+     *   +64 llist_node(8B), +72 vm_struct* ← va_vm_off=72
+     *
+     * Linux >= 5.7 (flags 移至尾部，vm 进入 union):
+     *   +0  va_start, +8 va_end, +16 rb_node(24B)
+     *   +40 list.next ← va_list_off=40
+     *   +56 vm (union) ← va_vm_off=56
+     */
+    bool old_layout = (g_kern_major < 5) ||
+                      (g_kern_major == 5 && g_kern_minor < 7);
+    uint64_t va_list_off = old_layout ? 48 : 40;
+    uint64_t va_vm_off   = old_layout ? 72 : 56;
+    /* 读缓冲须覆盖到 vm 字段之后 8 字节 */
+    size_t   va_buf_sz   = (size_t)(va_vm_off + 8);
+
     /* ── 1. 查找 vmap_area_list 符号 ─────────────────────────────────────── */
     uint64_t vmal_head = sym_addr("vmap_area_list");
     if (!vmal_head) {
@@ -1174,7 +1201,12 @@ static void check_vmap_area_list_scan(void)
         warn("  → 已由 CHECK 7（/proc/vmallocinfo 过滤扫描）提供覆盖");
         return;
     }
-    printf("    vmap_area_list @ %#lx\n\n", (unsigned long)vmal_head);
+    printf("    vmap_area_list @ %#lx  (内核 %d.%d，%s布局: list_off=%lu vm_off=%lu)\n\n",
+           (unsigned long)vmal_head,
+           g_kern_major, g_kern_minor,
+           old_layout ? "旧" : "新",
+           (unsigned long)va_list_off,
+           (unsigned long)va_vm_off);
 
     /* ── 2. 读链表头 next 指针（list_head.next） ──────────────────────────── */
     uint64_t cur;
@@ -1185,29 +1217,26 @@ static void check_vmap_area_list_scan(void)
 
     int scanned = 0, vm_alloc_cnt = 0, candidates = 0, hidden = 0;
 
+    /* vmap_area 缓冲区（最大 80 字节，覆盖旧/新布局） */
+    uint8_t va_buf[80];
+
     /* ── 3. 遍历 vmap_area_list 链表 ─────────────────────────────────────── */
     while (cur != vmal_head && scanned < 300000) {
         /*
-         * cur 指向 vmap_area.list 字段（偏移 +40），
-         * 减去偏移得到 struct vmap_area 的起始地址。
+         * cur 指向 vmap_area.list 字段，减去偏移还原结构体起始地址。
          */
-        uint64_t va_addr = cur - VMAP_AREA_LIST_OFF;
+        uint64_t va_addr = cur - va_list_off;
         scanned++;
 
-        /* 读 vmap_area 前 64 字节 */
-        uint8_t va_buf[64];
-        bool buf_ok = (kcore_read(va_addr, va_buf, sizeof(va_buf)) ==
-                       (ssize_t)sizeof(va_buf));
+        bool buf_ok = (kcore_read(va_addr, va_buf, va_buf_sz) ==
+                       (ssize_t)va_buf_sz);
 
-        /*
-         * 先更新 cur（推进链表），再处理数据，
-         * 确保所有 continue 路径都能正确推进链表。
-         */
+        /* 先更新 cur（推进链表），再处理数据 */
         uint64_t list_next = 0;
         if (buf_ok)
-            memcpy(&list_next, va_buf + 40, 8);          /* vmap_area.list.next */
+            memcpy(&list_next, va_buf + va_list_off, 8);
         else
-            kcore_read_u64(cur, &list_next);              /* 退路：直接读 cur+0  */
+            kcore_read_u64(cur, &list_next);
 
         if (!IS_KADDR(list_next))
             break;
@@ -1217,31 +1246,26 @@ static void check_vmap_area_list_scan(void)
             continue;
 
         uint64_t va_start, va_end, vm_ptr;
-        memcpy(&va_start, va_buf + 0,              8);
-        memcpy(&va_end,   va_buf + 8,              8);
-        memcpy(&vm_ptr,   va_buf + VMAP_AREA_VM_OFF, 8);
+        memcpy(&va_start, va_buf + 0,          8);
+        memcpy(&va_end,   va_buf + 8,          8);
+        memcpy(&vm_ptr,   va_buf + va_vm_off,  8);
 
         uint64_t va_size = va_end - va_start;
 
-        /* 大小过滤：太小（无法容纳 struct module）或太大（异常） */
         if (va_size < MOD_SIG_BYTES || va_size > 256ULL * 1024 * 1024)
             continue;
 
-        /* vm 指针必须有效（非 free/lazy-purge 的空闲区域） */
         if (!IS_KADDR(vm_ptr))
             continue;
 
-        /* ── 4. 读 vm_struct 验证：addr==va_start 且带 VM_ALLOC 标志 ──── */
+        /* ── 4. 读 vm_struct 验证 ────────────────────────────────────────── */
         uint64_t vm_addr_f = 0, vm_flags = 0;
         if (!kcore_read_u64(vm_ptr + VM_STRUCT_ADDR_OFF,  &vm_addr_f) ||
             !kcore_read_u64(vm_ptr + VM_STRUCT_FLAGS_OFF, &vm_flags))
             continue;
 
-        /* vm->addr 应与 va_start 完全一致 */
         if (vm_addr_f != va_start)
             continue;
-
-        /* 必须是 VM_ALLOC 分配（内核模块、vmalloc 等），跳过 vmap/ioremap */
         if (!(vm_flags & VM_ALLOC_FLAG))
             continue;
 
@@ -1252,20 +1276,17 @@ static void check_vmap_area_list_scan(void)
         if (kcore_read(va_start, buf, MOD_SIG_BYTES) != MOD_SIG_BYTES)
             continue;
 
-        /* state (offset 0, 4B): 合法值 0–3（LIVE/COMING/GOING/UNFORMED） */
         uint32_t state;
         memcpy(&state, buf + 0, 4);
         if (state > 3)
             continue;
 
-        /* list.next / list.prev (offset 8/16, 各 8B): 有效内核指针，8B 对齐 */
         uint64_t mod_lnext, mod_lprev;
         memcpy(&mod_lnext, buf + 8,  8);
         memcpy(&mod_lprev, buf + 16, 8);
         if (!IS_KADDR(mod_lnext) || !IS_KADDR(mod_lprev))
             continue;
 
-        /* name (offset 24, 56B): 可打印 ASCII，首字符合法，必须有 null 终止 */
         char name[MODULE_NAME_LEN + 1];
         memcpy(name, buf + 24, MODULE_NAME_LEN);
         name[MODULE_NAME_LEN] = '\0';
@@ -1281,14 +1302,13 @@ static void check_vmap_area_list_scan(void)
         if (nlen <= 0)
             continue;
 
-        /* 链表交叉验证：mod_lnext - 8 处的 state 字段也应合法（0–3） */
         uint32_t next_state = 0xff;
         if (kcore_read(mod_lnext - 8, &next_state, 4) != 4 || next_state > 3)
             continue;
 
         candidates++;
 
-        /* ── 6. 与 /proc/modules 对比，报告隐藏模块 ────────────────────── */
+        /* ── 6. 与 /proc/modules 对比 ───────────────────────────────────── */
         bool in_proc = name_in_list(name, procmod_list, procmod_list_n);
         if (!in_proc) {
             alert("  HIDDEN MODULE (vmap_area_list 直接扫描): '%s'", name);
@@ -1309,7 +1329,11 @@ static void check_vmap_area_list_scan(void)
     printf("    vmap_area 遍历: %d 条目，VM_ALLOC: %d 个，"
            "struct module 候选: %d，隐藏: %d\n",
            scanned, vm_alloc_cnt, candidates, hidden);
-    if (hidden == 0)
+    if (vm_alloc_cnt == 0 && scanned > 0) {
+        warn("  VM_ALLOC=0 且 scanned=%d：vm 字段偏移可能仍不匹配此内核，"
+             "建议改用 modscan.ko（内核态编译，无偏移猜测）", scanned);
+    }
+    if (hidden == 0 && vm_alloc_cnt > 0)
         ok("  vmap_area_list 直接扫描：未发现隐藏模块");
 }
 
@@ -1517,6 +1541,7 @@ int main(void)
 
     struct utsname uts;
     uname(&uts);
+    parse_kernel_version(uts.release);
 
     printf("\n" C_BLU "╔══════════════════════════════════════════╗\n"
                       "║      ModScan Kcore Deep Scanner          ║\n"

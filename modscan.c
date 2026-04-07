@@ -40,6 +40,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/vmalloc.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
 # define MODSCAN_KPROBE_KALLSYMS 1
@@ -203,6 +204,209 @@ static bool name_in_modules_list(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/*  vmap_area_list scan — Volatility 3 method, executed in kernel space */
+/* ------------------------------------------------------------------ */
+
+/*
+ * struct vmap_area layout (x86-64) differs by kernel version:
+ *
+ * Linux < 5.7  (flags field before rb_node):
+ *   +0   va_start   8B
+ *   +8   va_end     8B
+ *   +16  flags      8B  ← extra unsigned long
+ *   +24  rb_node   24B  (3 × 8B pointer)
+ *   +48  list.next  8B  ← VA_LIST_OFF = 48
+ *   +56  list.prev  8B
+ *   +64  llist_node 8B  (purge_list.next)
+ *   +72  vm         8B  ← VA_VM_OFF   = 72
+ *
+ * Linux >= 5.7 (no separate flags, vm in union after list):
+ *   +0   va_start   8B
+ *   +8   va_end     8B
+ *   +16  rb_node   24B
+ *   +40  list.next  8B  ← VA_LIST_OFF = 40
+ *   +48  list.prev  8B
+ *   +56  vm (union) 8B  ← VA_VM_OFF   = 56
+ *   +64  flags      8B
+ *
+ * To convert a list.next pointer to the struct start:
+ *   vmap_area* = list_next_ptr - VA_LIST_OFF
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+# define VA_LIST_OFF  40UL
+# define VA_VM_OFF    56UL
+#else
+# define VA_LIST_OFF  48UL
+# define VA_VM_OFF    72UL
+#endif
+
+/* vm_struct layout (stable across versions, only need addr@+8 and flags@+24) */
+#define VM_STRUCT_ADDR_OFF   8UL
+#define VM_STRUCT_FLAGS_OFF  24UL
+
+/* safe kernel read: handles unmapped/faulting addresses without crashing */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+# define vmscan_read(dst, src, n)  copy_from_kernel_nofault((dst), (src), (n))
+#else
+# define vmscan_read(dst, src, n)  probe_kernel_read((dst), (src), (n))
+#endif
+
+static inline bool vmscan_is_kptr(unsigned long p)
+{
+	return p != 0 && (p & 7) == 0 && p >= 0xffff000000000000UL;
+}
+
+/*
+ * modscan_vmap_scan() - walk vmap_area_list from kernel space and scan
+ * every VM_ALLOC region for a struct module signature.
+ *
+ * MUST be called with module_mutex held (calls name_in_modules_list).
+ *
+ * This is the exact equivalent of Volatility 3's linux.hidden_modules
+ * plugin, but running live in kernel space:
+ *   - Reads vmap_area_list directly (not via /proc/vmallocinfo)
+ *   - Dereferences vm_struct to validate VM_ALLOC flag and addr match
+ *   - Checks struct module signature fields in the mapped memory
+ *   - Reports modules whose name is absent from the modules linked list
+ */
+static void modscan_vmap_scan(struct seq_file *m)
+{
+	unsigned long vmal_head, cur;
+	int scanned = 0, vm_cnt = 0, candidates = 0, n_hidden = 0;
+
+	vmal_head = modscan_kallsyms("vmap_area_list");
+	if (!vmal_head) {
+		seq_puts(m, "  (vmap_area_list not in kallsyms"
+			      " — need CONFIG_KALLSYMS_ALL=y)\n");
+		return;
+	}
+	seq_printf(m, "  vmap_area_list @ 0x%lx  "
+		       "(layout: kernel %s 5.7, list_off=%lu vm_off=%lu)\n\n",
+		   vmal_head,
+		   LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0) ? ">=" : "<",
+		   VA_LIST_OFF, VA_VM_OFF);
+
+	/* Read the sentinel head's first .next pointer */
+	if (vmscan_read(&cur, (void *)vmal_head, sizeof(cur)) ||
+	    !vmscan_is_kptr(cur)) {
+		seq_puts(m, "  Cannot read vmap_area_list.next\n");
+		return;
+	}
+
+	while (cur != vmal_head && scanned < 300000) {
+		unsigned long va_base    = cur - VA_LIST_OFF;
+		unsigned long va_start   = 0, va_end   = 0;
+		unsigned long vm_ptr     = 0, list_next = 0;
+		scanned++;
+
+		/* Read the four fields we care about from the vmap_area */
+		if (vmscan_read(&va_start,  (void *)(va_base + 0),          8) ||
+		    vmscan_read(&va_end,    (void *)(va_base + 8),          8) ||
+		    vmscan_read(&list_next, (void *)(va_base + VA_LIST_OFF), 8) ||
+		    vmscan_read(&vm_ptr,    (void *)(va_base + VA_VM_OFF),   8))
+			break;   /* kcore/page gone — stop traversal */
+
+		/* Advance cur before any continue so we never stall */
+		cur = list_next;
+		if (!vmscan_is_kptr(cur))
+			break;
+
+		/* Skip free/lazy-purge areas (vm pointer is NULL or size value) */
+		if (!vmscan_is_kptr(vm_ptr))
+			continue;
+
+		unsigned long va_size = va_end - va_start;
+		if (va_size < 80 || va_size > 256UL * 1024 * 1024)
+			continue;
+
+		/*
+		 * Validate via vm_struct:
+		 *   vm->addr  (offset +8)  must equal va_start
+		 *   vm->flags (offset +24) must have VM_ALLOC set
+		 */
+		unsigned long vm_addr_v = 0, vm_flags_v = 0;
+		if (vmscan_read(&vm_addr_v,  (void *)(vm_ptr + VM_STRUCT_ADDR_OFF),  8) ||
+		    vmscan_read(&vm_flags_v, (void *)(vm_ptr + VM_STRUCT_FLAGS_OFF), 8))
+			continue;
+		if (vm_addr_v != va_start)
+			continue;
+		if (!(vm_flags_v & VM_ALLOC))
+			continue;
+
+		vm_cnt++;
+
+		/*
+		 * struct module signature check (x86-64, stable layout):
+		 *   +0   state     u32  : must be 0–3
+		 *   +8   list.next u64  : valid kernel pointer, 8B-aligned
+		 *   +16  list.prev u64  : same
+		 *   +24  name[56]       : printable ASCII, NUL-terminated
+		 */
+		u32 state = 0xff;
+		unsigned long mod_lnext = 0, mod_lprev = 0;
+		char name[MODULE_NAME_LEN + 1] = {};
+
+		if (vmscan_read(&state,     (void *)(va_start + 0),  4) ||
+		    vmscan_read(&mod_lnext, (void *)(va_start + 8),  8) ||
+		    vmscan_read(&mod_lprev, (void *)(va_start + 16), 8) ||
+		    vmscan_read(name,       (void *)(va_start + 24), MODULE_NAME_LEN))
+			continue;
+
+		if (state > MODULE_STATE_UNFORMED)
+			continue;
+		if (!vmscan_is_kptr(mod_lnext) || !vmscan_is_kptr(mod_lprev))
+			continue;
+
+		/* Name validation: printable ASCII, non-empty, NUL-terminated */
+		name[MODULE_NAME_LEN] = '\0';
+		{
+			char c0 = name[0];
+			if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') ||
+			      (c0 >= '0' && c0 <= '9') || c0 == '_'))
+				continue;
+		}
+		{
+			int i, nlen = -1;
+			for (i = 0; i < MODULE_NAME_LEN; i++) {
+				if (name[i] == '\0') { nlen = i; break; }
+				if ((unsigned char)name[i] < 0x20 ||
+				    (unsigned char)name[i] >= 0x7f)
+					break;
+			}
+			if (nlen <= 0)
+				continue;
+		}
+
+		/* Chain cross-check: list.next - 8 should also have valid state */
+		{
+			u32 next_state = 0xff;
+			if (vmscan_read(&next_state,
+					(void *)(mod_lnext - 8), 4) ||
+			    next_state > MODULE_STATE_UNFORMED)
+				continue;
+		}
+
+		candidates++;
+
+		/* Compare against the live modules list (held under module_mutex) */
+		if (!name_in_modules_list(name)) {
+			seq_printf(m,
+				   "VMAP-HIDDEN  %-20s  @ 0x%lx"
+				   "  size=%-8lu  state=%u\n",
+				   name, va_start, va_size, state);
+			n_hidden++;
+		}
+	}
+
+	seq_printf(m,
+		   "  Scanned: %d vmap_areas | VM_ALLOC: %d"
+		   " | module candidates: %d | hidden: %d\n",
+		   scanned, vm_cnt, candidates, n_hidden);
+	if (n_hidden == 0)
+		seq_puts(m, "  (no hidden modules found by vmap_area scan)\n");
+}
+
+/* ------------------------------------------------------------------ */
 /*  /proc/modscan — read: scan for hidden modules                      */
 /* ------------------------------------------------------------------ */
 
@@ -278,6 +482,22 @@ static int modscan_show(struct seq_file *m, void *v)
 			   n_sysfs_tampered);
 
 	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
+
+	/*
+	 * === vmap_area_list scan (Volatility 3 method) ===
+	 *
+	 * Walk the kernel's vmap_area_list directly (not via /proc/vmallocinfo)
+	 * and scan every VM_ALLOC region for a struct module signature.
+	 * This catches modules hidden by list_del() even when kset/sysfs have
+	 * also been cleaned up (kobject_del), i.e. when the kset scan above
+	 * would miss them.
+	 */
+	seq_puts(m, "\n=== vmap_area_list Scan (Volatility 3 Method) ===\n\n");
+	if (mutex_lock_killable(&module_mutex) == 0) {
+		modscan_vmap_scan(m);
+		mutex_unlock(&module_mutex);
+	}
+
 	return 0;
 }
 
