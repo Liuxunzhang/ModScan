@@ -1111,6 +1111,208 @@ static int modscan_open(struct inode *inode, struct file *file)
  * The spinlock is released before acquiring the mutex because
  * mutex_lock may sleep, which is forbidden in atomic context.
  */
+
+/* ------------------------------------------------------------------ */
+/*  safe-detach — remove rootkit WITHOUT calling exit() or vfree()    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Why not rmmod --force?
+ *   rmmod calls delete_module() which calls mod->exit().
+ *   Sophisticated rootkits put orderly_poweroff() in exit() as a
+ *   self-protection: if you try to unload them, they power off the
+ *   server.  rmmod --force also calls vfree() which frees the code
+ *   pages while hooks may still point into them → use-after-free crash.
+ *
+ * safe-detach does ONLY:
+ *   1. Determine the module's page range (by probing surrounding pages)
+ *   2. Cancel any timers whose callback is in that range
+ *   3. Scan the syscall table for hooks in that range (report only)
+ *   4. list_del the module from the modules list (under module_mutex)
+ *      — this makes lsmod/rmmod blind to it again, but cleanly
+ *   5. Does NOT call mod->exit()
+ *   6. Does NOT call vfree() / module_deallocate()
+ *
+ * Result: the module's memory pages stay mapped forever (orphaned).
+ * Any remaining hooks (proc fops, netfilter, etc.) still call into
+ * live code — no crash.  The server stays up.  Plan a proper reboot
+ * once the persistence mechanism is removed.
+ */
+
+#ifdef MODULES_VADDR
+static ssize_t modscan_safe_detach(unsigned long mod_addr, size_t count)
+{
+	u32           state = 0xff;
+	char          name[MODULE_NAME_LEN + 1];
+	struct module *mod;
+	unsigned long range_start, range_end, page;
+	unsigned long tvec_bases_addr;
+	int  n_timers = 0, n_hooks = 0;
+	int  cpu;
+	unsigned long *sct;
+	unsigned long ks, ke;
+	int  i;
+
+	/* ── Validate ─────────────────────────────────────────────── */
+	if (mod_addr < MODULES_VADDR || mod_addr >= MODULES_END ||
+	    (mod_addr & 7)) {
+		pr_err("modscan: safe-detach: bad address 0x%lx\n", mod_addr);
+		return -ERANGE;
+	}
+	if (vmscan_read(&state, (void *)mod_addr, 4) ||
+	    state > MODULE_STATE_UNFORMED) {
+		pr_err("modscan: safe-detach: no valid struct module at 0x%lx\n",
+		       mod_addr);
+		return -EINVAL;
+	}
+	memset(name, 0, sizeof(name));
+	if (vmscan_read(name, (void *)(mod_addr + 24), MODULE_NAME_LEN))
+		return -EINVAL;
+	name[MODULE_NAME_LEN] = '\0';
+	mod = (struct module *)mod_addr;
+
+	/* ── Determine mapped page range ──────────────────────────── *
+	 * Walk backward and forward from mod_addr until pages become
+	 * unmapped.  Guard pages between vmalloc allocations ensure
+	 * we stop at the correct boundary.
+	 */
+	range_start = mod_addr & PAGE_MASK;
+	for (page = range_start - PAGE_SIZE;
+	     page >= MODULES_VADDR && page < range_start;
+	     page -= PAGE_SIZE) {
+		u8 probe;
+		if (vmscan_read(&probe, (void *)page, 1))
+			break;
+		range_start = page;
+	}
+	range_end = (mod_addr & PAGE_MASK) + PAGE_SIZE;
+	for (page = range_end;
+	     page < MODULES_END;
+	     page += PAGE_SIZE) {
+		u8 probe;
+		if (vmscan_read(&probe, (void *)page, 1))
+			break;
+		range_end = page + PAGE_SIZE;
+	}
+	pr_info("modscan: safe-detach '%s': page range 0x%lx – 0x%lx"
+		" (%lu KB)\n",
+		name, range_start, range_end,
+		(range_end - range_start) >> 10);
+
+	/* ── Cancel timers in range ───────────────────────────────── */
+	tvec_bases_addr = modscan_kallsyms("tvec_bases");
+	if (tvec_bases_addr) {
+		for_each_possible_cpu(cpu) {
+			unsigned long base_ptr = 0;
+			unsigned long base;
+			int slot;
+			unsigned long pcp_addr = tvec_bases_addr +
+						  __per_cpu_offset[cpu];
+
+			if (vmscan_read(&base_ptr, (void *)pcp_addr,
+					sizeof(base_ptr)) ||
+			    !vmscan_is_kptr(base_ptr))
+				continue;
+			base = base_ptr;
+
+			for (slot = 0; slot < TVEC_BASE_WHEELS; slot++) {
+				unsigned long head_addr;
+				unsigned long cur;
+				int depth = 0;
+
+				head_addr = base + TVB_VEC_OFF +
+					    slot * 2 * sizeof(unsigned long);
+				if (vmscan_read(&cur, (void *)head_addr, 8))
+					continue;
+
+				while (cur != head_addr && depth < 4096) {
+					unsigned long fn = 0, nxt = 0;
+
+					depth++;
+					if (vmscan_read(&fn,
+							(void *)(cur + TL_FUNC_OFF),
+							8))
+						break;
+					if (vmscan_read(&nxt, (void *)cur, 8))
+						break;
+
+					if (fn >= range_start &&
+					    fn <  range_end) {
+						struct timer_list *tl =
+							(struct timer_list *)cur;
+						if (del_timer_sync(tl)) {
+							pr_info("modscan:"
+								" safe-detach:"
+								" canceled timer"
+								" @ 0x%lx"
+								" fn=0x%lx\n",
+								cur, fn);
+							n_timers++;
+						}
+					}
+					cur = nxt;
+				}
+			}
+		}
+	}
+	pr_info("modscan: safe-detach: %d timer(s) canceled\n", n_timers);
+
+	/* ── Syscall table hook scan (report only) ────────────────── */
+	sct = (unsigned long *)modscan_kallsyms("sys_call_table");
+	ks  = modscan_kallsyms("_stext");
+	ke  = modscan_kallsyms("_etext");
+	if (sct) {
+		for (i = 0; i < 400; i++) {
+			unsigned long fn;
+
+			if (vmscan_read(&fn, (void *)&sct[i], 8))
+				continue;
+			if (fn >= range_start && fn < range_end) {
+				pr_warn("modscan: safe-detach:"
+					" SYSCALL HOOK sys_call_table[%d]"
+					" = 0x%lx (in rootkit range)\n",
+					i, fn);
+				n_hooks++;
+			}
+		}
+	}
+	if (n_hooks)
+		pr_warn("modscan: safe-detach: %d syscall hook(s) remain"
+			" in orphaned code — consider reboot\n", n_hooks);
+	else
+		pr_info("modscan: safe-detach: no syscall hooks found\n");
+
+	/* ── list_del from modules list ───────────────────────────── *
+	 * Only if the module is currently in the list (restored by a
+	 * prior restore-addr call).  If it has LIST_POISON ptrs, skip
+	 * — it's already not linked.
+	 */
+	if (mutex_lock_killable(&module_mutex) == 0) {
+		if (name_in_modules_list(name)) {
+			list_del(&mod->list);
+			/* Poison the entry so double-del is safe */
+			INIT_LIST_HEAD(&mod->list);
+			pr_info("modscan: safe-detach:"
+				" removed '%s' from modules list\n", name);
+		} else {
+			pr_info("modscan: safe-detach:"
+				" '%s' not in modules list (already hidden)\n",
+				name);
+		}
+		mutex_unlock(&module_mutex);
+	}
+
+	pr_info("modscan: safe-detach: '%s' complete.\n"
+		"  Memory at 0x%lx–0x%lx is ORPHANED (not freed).\n"
+		"  No exit() called — rootkit self-protection bypassed.\n"
+		"  %d syscall hook(s) remain but call into live memory.\n"
+		"  System is stable. Remove persistence then reboot cleanly.\n",
+		name, range_start, range_end, n_hooks);
+
+	return count;
+}
+#endif /* MODULES_VADDR */
+
 /*
  * modscan_restore_raw() — restore a module whose struct module address was
  * discovered by the raw memory scan (modscan_raw_scan).
@@ -1250,6 +1452,18 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	 *   echo 'fix-refcnt 0xffffffffc0931a80' > /proc/modscan
 	 */
 #ifdef MODULES_VADDR
+#ifdef MODULES_VADDR
+	if (strncmp(kbuf, "safe-detach ", 12) == 0) {
+		unsigned long sd_addr = 0;
+
+		if (kstrtoul(kbuf + 12, 16, &sd_addr)) {
+			pr_err("modscan: safe-detach: bad address\n");
+			return -EINVAL;
+		}
+		return modscan_safe_detach(sd_addr, count);
+	}
+#endif
+
 	if (strncmp(kbuf, "fix-refcnt ", 11) == 0) {
 		unsigned long fix_addr = 0;
 		struct module *fmod;
