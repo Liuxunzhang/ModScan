@@ -8,8 +8,9 @@
  * 检测内容：
  *   1. modules_disabled 标志
  *   2. DKOM list_del 隐藏模块（walk modules 链表，与 /sys/module/ 对比）
- *   3. finit_module / init_module / load_module 内联 patch
- *   4. 系统调用表指针劫持 (sys_call_table[313])
+ *   3. finit_module / init_module / load_module / tcp4_seq_show 等内联 patch
+ *   4. 系统调用表指针劫持 (sys_call_table[313/175/78/217])
+ *   5. Skidmap 恶意软件特征（已知模块名、getdents64 hook、PAM 后门、ld.so.preload）
  *
  * struct module 布局（x86-64，无 __randomize_layout，跨内核版本稳定）：
  *   offset  0: enum module_state state   (4 bytes)
@@ -39,6 +40,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ─── ANSI 颜色 ─────────────────────────────────────────────────────────── */
@@ -485,10 +487,16 @@ static void check_function_integrity(void)
         const char *symname;
         const char *desc;
     } targets[] = {
-        { "__x64_sys_finit_module", "finit_module 系统调用入口" },
-        { "__x64_sys_init_module",  "init_module 系统调用入口"  },
-        { "load_module",            "核心模块加载函数"           },
-        { "security_kernel_post_read_file", "LSM post-read-file hook" },
+        { "__x64_sys_finit_module",          "finit_module 系统调用入口"                    },
+        { "__x64_sys_init_module",           "init_module 系统调用入口"                     },
+        { "load_module",                     "核心模块加载函数"                              },
+        { "security_kernel_post_read_file",  "LSM post-read-file hook"                    },
+        /* Skidmap 特征目标：网络连接隐藏 & CPU 使用率伪造 */
+        { "tcp4_seq_show",                   "TCP4 连接列表（Skidmap 隐藏挖矿网络连接）"     },
+        { "udp4_seq_show",                   "UDP4 连接列表（Skidmap 隐藏挖矿网络连接）"     },
+        { "tcp6_seq_show",                   "TCP6 连接列表"                                },
+        { "udp6_seq_show",                   "UDP6 连接列表"                                },
+        { "proc_stat_show",                  "/proc/stat 输出（Skidmap 伪造 CPU 空闲率）"   },
         { NULL, NULL }
     };
 
@@ -543,9 +551,12 @@ static void check_syscall_table(void)
         const char *symname;
         const char *desc;
     } checks[] = {
-        { 313, "__x64_sys_finit_module", "finit_module (#313)" },
-        { 175, "__x64_sys_init_module",  "init_module  (#175)" },
-        { 0,   NULL, NULL }
+        { 313, "__x64_sys_finit_module",  "finit_module  (#313)"  },
+        { 175, "__x64_sys_init_module",   "init_module   (#175)"  },
+        /* Skidmap 主要通过劫持这两个系统调用隐藏文件 */
+        {  78, "__x64_sys_getdents",      "getdents      (#78)"   },
+        { 217, "__x64_sys_getdents64",    "getdents64    (#217)"  },
+        {   0, NULL, NULL }
     };
 
     for (int i = 0; checks[i].symname; i++) {
@@ -586,6 +597,200 @@ static void check_syscall_table(void)
             }
         }
     }
+}
+
+/* ─── CHECK 5: Skidmap 恶意软件特征检测 ─────────────────────────────────── */
+/*
+ * Skidmap 是一种以加密货币挖矿为目的的 Linux rootkit，其内核模块通过以下手段隐藏：
+ *   - 劫持 getdents64 系统调用（已在 CHECK 4 中检测）
+ *   - 劫持 tcp4/udp4_seq_show 隐藏挖矿网络连接（已在 CHECK 3 中检测）
+ *   - 使用一批已知的伪装模块名（如 iproute、netlink、mstf 等）
+ *   - 替换 pam_unix.so 实现免密登录后门
+ *   - 写入 /etc/ld.so.preload 实现用户态文件隐藏
+ */
+static void check_skidmap_indicators(void)
+{
+    info("CHECK 5: Skidmap 恶意软件特征检测");
+
+    /* ── 1. 已知 Skidmap 内核模块名扫描（via /proc/kallsyms）────────────── */
+    printf("  [1] 已知 Skidmap 内核模块名扫描\n");
+
+    /*
+     * 这些模块名来自已公开的 Skidmap 样本分析报告（Trend Micro、AT&T Alien Labs 等）：
+     *   iproute   — 伪装成网络路由模块，是最常见的 Skidmap 主模块名
+     *   netlink   — 伪装成内核 netlink 通信模块
+     *   mstf      — 早期变种使用的模块名
+     *   bcmap     — 区块链相关，用于与 C2 通信
+     *   kaudited  — 伪装成内核审计模块（kauditd）
+     *   kbuild    — 伪装成内核构建模块
+     *   pc_keyb   — 伪装成键盘驱动
+     *   snd_floppy— 伪装成声卡/软驱驱动
+     */
+    static const char * const skidmap_mods[] = {
+        "iproute", "netlink", "mstf", "bcmap",
+        "kaudited", "kbuild", "pc_keyb", "snd_floppy",
+        NULL
+    };
+    /* 记录每个名字是否已上报，避免重复告警 */
+    bool reported[8] = {false};
+    int  skid_found  = 0;
+
+    FILE *kf = fopen("/proc/kallsyms", "r");
+    if (!kf) {
+        warn("  无法打开 /proc/kallsyms，跳过已知模块名扫描");
+    } else {
+        char line[256];
+        while (fgets(line, sizeof(line), kf)) {
+            /* 在行末查找 [modname] 字段 */
+            char *lb = strchr(line, '[');
+            char *rb = lb ? strchr(lb + 1, ']') : NULL;
+            if (!lb || !rb) continue;
+            int   mlen = (int)(rb - lb - 1);
+            if (mlen <= 0 || mlen >= 56) continue;
+
+            char mname[56];
+            memcpy(mname, lb + 1, (size_t)mlen);
+            mname[mlen] = '\0';
+
+            for (int i = 0; skidmap_mods[i]; i++) {
+                if (reported[i]) continue;
+                if (strcmp(mname, skidmap_mods[i]) != 0) continue;
+
+                reported[i] = true;
+                skid_found++;
+                bool in_proc  = name_in_list(mname, procmod_list,  procmod_list_n);
+                bool in_sysfs = name_in_list(mname, sysfs_modlist, sysfs_modlist_n);
+
+                if (!in_proc) {
+                    alert("  SKIDMAP 已知模块 '%s': 符号存在于 kallsyms"
+                          " 但不在 /proc/modules（已通过 DKOM 隐藏）", mname);
+                } else if (!in_sysfs) {
+                    alert("  SKIDMAP 已知模块 '%s': 在 /proc/modules"
+                          " 但不在 /sys/module/（异常状态）", mname);
+                } else {
+                    alert("  SKIDMAP 已知模块 '%s': 当前已加载！", mname);
+                }
+                FINDING();
+            }
+        }
+        fclose(kf);
+    }
+    if (skid_found == 0)
+        ok("  未发现已知 Skidmap 模块名");
+
+    /* ── 2. /etc/ld.so.preload 检测 ─────────────────────────────────────── */
+    printf("\n  [2] /etc/ld.so.preload 检测（用户态文件隐藏后门）\n");
+    /*
+     * Skidmap 及其他 rootkit 有时会向 /etc/ld.so.preload 写入恶意共享库路径，
+     * 使所有动态链接程序在启动时预加载该库，从而实现用户态的文件/进程隐藏。
+     */
+    {
+        struct stat pst;
+        if (stat("/etc/ld.so.preload", &pst) == 0) {
+            if (pst.st_size == 0) {
+                warn("  /etc/ld.so.preload 存在但为空文件（可疑，正常系统通常不存在此文件）");
+            } else {
+                FILE *pf = fopen("/etc/ld.so.preload", "r");
+                if (pf) {
+                    char buf[4096] = {0};
+                    size_t n = fread(buf, 1, sizeof(buf) - 1, pf);
+                    fclose(pf);
+                    buf[n] = '\0';
+                    alert("  /etc/ld.so.preload 存在且非空！内容:");
+                    /* 逐行打印，每行加缩进 */
+                    char *line = buf, *nl;
+                    while ((nl = strchr(line, '\n')) != NULL) {
+                        *nl = '\0';
+                        if (*line)
+                            alert("    → %s", line);
+                        line = nl + 1;
+                    }
+                    if (*line)
+                        alert("    → %s", line);
+                    FINDING();
+                }
+            }
+        } else {
+            ok("  /etc/ld.so.preload 不存在（正常）");
+        }
+    }
+
+    /* ── 3. PAM 后门检测 ─────────────────────────────────────────────────── */
+    printf("\n  [3] PAM 后门检测（pam_unix.so 完整性）\n");
+    /*
+     * Skidmap 会将系统的 pam_unix.so 替换为恶意版本，使其接受任意密码，
+     * 从而为攻击者提供免密码远程登录能力。
+     * 检测方法：检查文件大小与近期修改时间，异常大小或近期修改均视为可疑。
+     */
+    static const char * const pam_paths[] = {
+        "/lib/security/pam_unix.so",
+        "/lib64/security/pam_unix.so",
+        "/lib/x86_64-linux-gnu/security/pam_unix.so",
+        "/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
+        "/usr/lib/security/pam_unix.so",
+        NULL
+    };
+    bool pam_checked = false;
+    for (int i = 0; pam_paths[i]; i++) {
+        struct stat st;
+        if (stat(pam_paths[i], &st) != 0)
+            continue;
+
+        pam_checked = true;
+        time_t now       = time(NULL);
+        double age_hours = difftime(now, st.st_mtime) / 3600.0;
+
+        /* Skidmap 的伪造 pam_unix.so 通常非常小（<50KB），而真实的通常 >80KB */
+        bool size_suspicious = (st.st_size < 51200);  /* < 50 KB */
+        bool mtime_recent    = (age_hours < 48.0);    /* 48 小时内被修改 */
+
+        if (size_suspicious) {
+            alert("  PAM: %s 文件大小异常小 (%lld 字节 < 50KB)"
+                  " — 疑似被 Skidmap 替换！",
+                  pam_paths[i], (long long)st.st_size);
+            FINDING();
+        } else if (mtime_recent) {
+            warn("  PAM: %s 在 %.1f 小时前被修改 — 请确认是否为正常系统更新",
+                 pam_paths[i], age_hours);
+        } else {
+            ok("  PAM: %s 大小=%lldB  修改于 %.0f 小时前（正常）",
+               pam_paths[i], (long long)st.st_size, age_hours);
+        }
+        break;
+    }
+    if (!pam_checked)
+        warn("  未找到 pam_unix.so（非标准安装路径或未安装 PAM？）");
+
+    /* ── 4. 可疑 cron 持久化检测 ─────────────────────────────────────────── */
+    printf("\n  [4] Skidmap cron 持久化检测\n");
+    /*
+     * Skidmap 通常在系统 cron 目录中写入脚本以实现持久化，
+     * 在已隐藏文件的情况下 getdents64 hook 会让这些文件从 ls/find 中消失，
+     * 但通过 /proc/kcore 或直接读取 cron spool 仍可发现。
+     * 这里检查已知的 Skidmap cron 路径是否存在。
+     */
+    static const char * const cron_paths[] = {
+        "/etc/cron.d/kbuild",
+        "/etc/cron.d/iproute",
+        "/etc/cron.d/netlink",
+        "/var/spool/cron/root",
+        "/var/spool/cron/crontabs/root",
+        NULL
+    };
+    int cron_suspicious = 0;
+    for (int i = 0; cron_paths[i]; i++) {
+        struct stat st;
+        if (stat(cron_paths[i], &st) != 0)
+            continue;
+        /* /var/spool/cron/root 本身存在很正常，只检查 /etc/cron.d/ 下的 Skidmap 特征名 */
+        if (strncmp(cron_paths[i], "/etc/cron.d/", 12) == 0) {
+            alert("  CRON: 发现 Skidmap 特征 cron 文件: %s", cron_paths[i]);
+            FINDING();
+            cron_suspicious++;
+        }
+    }
+    if (cron_suspicious == 0)
+        ok("  未发现 Skidmap 特征 cron 文件");
 }
 
 /* ─── 主函数 ─────────────────────────────────────────────────────────────── */
@@ -631,13 +836,15 @@ int main(void)
         check_syscall_table();      printf("\n");
     }
 
+    check_skidmap_indicators(); printf("\n");
+
     /* 总结 */
     printf(C_BLU "────────────────────────────────────────────\n" C_RST);
     if (g_findings == 0) {
         ok("结论: 未发现异常（共 0 项告警）");
         return 0;
     } else {
-        alert("结论: 发现 %d 项异常，详见上方 [ALERT] 行", g_findings);
+        alert("结论: 发现 %d 项异常（含 Skidmap 特征），详见上方 [ALERT] 行", g_findings);
         printf("\n" C_YEL "还原建议:" C_RST "\n");
         printf("  方案A: 若 modscan.ko 已预加载\n");
         printf("    echo 'restore <模块名>' > /proc/modscan\n\n");
