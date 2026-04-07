@@ -325,7 +325,8 @@ static void modscan_vmap_scan(struct seq_file *m)
 		if (!vmscan_is_kptr(vm_ptr))
 			continue;
 
-		unsigned long va_size = va_end - va_start;
+		unsigned long va_size;
+		va_size = va_end - va_start;
 		if (va_size < 80 || va_size > 256UL * 1024 * 1024)
 			continue;
 
@@ -334,7 +335,8 @@ static void modscan_vmap_scan(struct seq_file *m)
 		 *   vm->addr  (offset +8)  must equal va_start
 		 *   vm->flags (offset +24) must have VM_ALLOC set
 		 */
-		unsigned long vm_addr_v = 0, vm_flags_v = 0;
+		unsigned long vm_addr_v = 0;
+		unsigned long vm_flags_v = 0;
 		if (vmscan_read(&vm_addr_v,  (void *)(vm_ptr + VM_STRUCT_ADDR_OFF),  8) ||
 		    vmscan_read(&vm_flags_v, (void *)(vm_ptr + VM_STRUCT_FLAGS_OFF), 8))
 			continue;
@@ -352,9 +354,13 @@ static void modscan_vmap_scan(struct seq_file *m)
 		 *   +16  list.prev u64  : same
 		 *   +24  name[56]       : printable ASCII, NUL-terminated
 		 */
-		u32 state = 0xff;
-		unsigned long mod_lnext = 0, mod_lprev = 0;
-		char name[MODULE_NAME_LEN + 1] = {};
+		u32 state;
+		unsigned long mod_lnext;
+		unsigned long mod_lprev;
+		char name[MODULE_NAME_LEN + 1];
+		state = 0xff;
+		mod_lnext = 0; mod_lprev = 0;
+		memset(name, 0, sizeof(name));
 
 		if (vmscan_read(&state,     (void *)(va_start + 0),  4) ||
 		    vmscan_read(&mod_lnext, (void *)(va_start + 8),  8) ||
@@ -752,7 +758,7 @@ static void modscan_raw_scan(struct seq_file *m)
 static int modscan_show(struct seq_file *m, void *v)
 {
 	struct modscan_snap *snap;
-	int i, n = 0, n_hidden = 0;
+	int i, n = 0, n_hidden = 0, n_sysfs_tampered = 0;
 
 	snap = snapshot_kset(&n);
 	if (IS_ERR(snap))
@@ -798,7 +804,6 @@ static int modscan_show(struct seq_file *m, void *v)
 	 * but its sysfs entry is gone.
 	 */
 	seq_puts(m, "\n=== Sysfs Integrity Check (kset vs kernfs) ===\n\n");
-	int n_sysfs_tampered = 0;
 	for (i = 0; i < n; i++) {
 		if (strcmp(snap[i].name, THIS_MODULE->name) == 0)
 			continue;
@@ -836,14 +841,24 @@ static int modscan_show(struct seq_file *m, void *v)
 
 		if (mutex_lock_killable(&module_mutex) == 0) {
 			list_for_each_entry(mod, modules_list_head, list) {
-				int rc = atomic_read(&mod->refcnt);
 				unsigned int csz = mod->core_size;
 				unsigned int isz = mod->init_size;
-				/* Legitimate: csz > 0, isz >= 0, rc >= 0 */
+				long rc = 0;
+#ifdef CONFIG_MODULE_UNLOAD
+				{
+					int cpu;
+					for_each_possible_cpu(cpu) {
+						struct module_ref *mr =
+							per_cpu_ptr(mod->refptr, cpu);
+						rc += (long)mr->incs - (long)mr->decs;
+					}
+				}
+#endif
+				/* Legitimate: csz > 0, csz < 256 MB, rc >= 0 */
 				if (rc < 0 || csz == 0 || csz > (256u << 20)) {
 					seq_printf(m,
 						   "CORRUPT-FIELDS  %-20s"
-						   "  core_sz=%u init_sz=%u refcnt=%d\n",
+						   "  core_sz=%u init_sz=%u refcnt=%ld\n",
 						   mod->name, csz, isz, rc);
 					n_corrupt++;
 				}
@@ -1128,8 +1143,18 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 		 * we skip here.  rmmod --force will trigger the exit() path
 		 * without checking size.
 		 */
-		atomic_set(&fmod->refcnt, 0);
 		fmod->state = MODULE_STATE_LIVE;
+#ifdef CONFIG_MODULE_UNLOAD
+		/* Zero per-CPU reference counters (3.10 uses refptr, not atomic refcnt) */
+		{
+			int cpu;
+			for_each_possible_cpu(cpu) {
+				struct module_ref *mr = per_cpu_ptr(fmod->refptr, cpu);
+				mr->incs = 0;
+				mr->decs = 0;
+			}
+		}
+#endif
 
 		pr_info("modscan: fix-refcnt: '%s' @ 0x%lx"
 			" — refcnt reset to 0, state set LIVE\n",
