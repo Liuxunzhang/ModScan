@@ -775,9 +775,6 @@ static int modscan_show(struct seq_file *m, void *v)
 		}
 	}
 
-	mutex_unlock(&module_mutex);
-	kfree(snap);
-
 	if (n_hidden == 0)
 		seq_puts(m, "(no hidden modules detected)\n");
 	else
@@ -819,6 +816,9 @@ static int modscan_show(struct seq_file *m, void *v)
 	else
 		seq_printf(m, "\n%d sysfs-tampered module(s) found.\n",
 			   n_sysfs_tampered);
+
+	mutex_unlock(&module_mutex);
+	kfree(snap);
 
 	seq_puts(m, "\nTo restore: echo 'restore <name>' > /proc/modscan\n");
 

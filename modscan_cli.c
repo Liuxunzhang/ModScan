@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define PROC_PATH   "/proc/modscan"
@@ -25,12 +26,15 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"Usage:\n"
-		"  %s scan              - scan for DKOM-hidden kernel modules\n"
-		"  %s restore <name>    - restore a hidden module to the module list\n"
+		"  %s scan                    - scan for hidden kernel modules\n"
+		"  %s restore <name>          - restore hidden module by name\n"
+		"  %s restore-addr <hexaddr>  - restore hidden module by struct module address\n"
+		"  %s unload <name>           - unload module via delete_module syscall\n"
+		"  %s unload-force <name>     - force unload module (O_TRUNC)\n"
 		"\n"
 		"The modscan kernel module must be loaded first:\n"
 		"  sudo insmod modscan.ko\n",
-		prog, prog);
+		prog, prog, prog, prog, prog);
 	exit(EXIT_FAILURE);
 }
 
@@ -117,6 +121,96 @@ static int cmd_restore(const char *modname)
 	return EXIT_SUCCESS;
 }
 
+static int cmd_restore_addr(const char *raw_addr)
+{
+	char cmd[64];
+	char *end = NULL;
+	unsigned long long val;
+	ssize_t written;
+	int fd, len;
+
+	errno = 0;
+	val = strtoull(raw_addr, &end, 16);
+	if (errno != 0 || end == raw_addr || *end != '\0' || val == 0ULL) {
+		fprintf(stderr,
+			"error: invalid address '%s' (expect hex, e.g. 0xffffffffc0395a80)\n",
+			raw_addr);
+		return EXIT_FAILURE;
+	}
+
+	len = snprintf(cmd, sizeof(cmd), "restore-addr %s", raw_addr);
+	if (len < 0 || len >= (int)sizeof(cmd)) {
+		fprintf(stderr, "error: restore-addr command too long\n");
+		return EXIT_FAILURE;
+	}
+
+	fd = open(PROC_PATH, O_WRONLY);
+	if (fd < 0) {
+		perror("open " PROC_PATH);
+		if (errno == ENOENT)
+			fprintf(stderr, "Is the modscan kernel module loaded?\n"
+					"  sudo insmod modscan.ko\n");
+		return EXIT_FAILURE;
+	}
+
+	written = write(fd, cmd, len);
+	close(fd);
+
+	if (written < 0) {
+		perror("write");
+		return EXIT_FAILURE;
+	}
+
+	printf("Module at address '%s' restored to modules list.\n", raw_addr);
+	return EXIT_SUCCESS;
+}
+
+static int cmd_unload(const char *modname, int force)
+{
+	int flags = O_NONBLOCK;
+
+	if (force)
+		flags |= O_TRUNC;
+
+#ifdef SYS_delete_module
+	if (syscall(SYS_delete_module, modname, flags) == 0) {
+		printf("Module '%s' unloaded successfully.%s\n",
+		       modname,
+		       force ? " (forced)" : "");
+		return EXIT_SUCCESS;
+	}
+#else
+	errno = ENOSYS;
+#endif
+
+	switch (errno) {
+	case EBUSY:
+		fprintf(stderr,
+			"error: module '%s' is busy/in use (try unload-force).\n",
+			modname);
+		break;
+	case EAGAIN:
+		fprintf(stderr,
+			"error: module '%s' temporarily unavailable, retry later.\n",
+			modname);
+		break;
+	case ENOENT:
+		fprintf(stderr,
+			"error: module '%s' is not currently loaded.\n",
+			modname);
+		break;
+	case ENOSYS:
+		fprintf(stderr,
+			"error: delete_module syscall unavailable on this platform/toolchain.\n");
+		break;
+	default:
+		perror("delete_module");
+		break;
+	}
+
+	return EXIT_FAILURE;
+}
+
 int main(int argc, char *argv[])
 {
 	if (argc < 2)
@@ -131,6 +225,30 @@ int main(int argc, char *argv[])
 			usage(argv[0]);
 		}
 		return cmd_restore(argv[2]);
+	}
+
+	if (strcmp(argv[1], "restore-addr") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "error: restore-addr requires a hex address\n\n");
+			usage(argv[0]);
+		}
+		return cmd_restore_addr(argv[2]);
+	}
+
+	if (strcmp(argv[1], "unload") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "error: unload requires a module name\n\n");
+			usage(argv[0]);
+		}
+		return cmd_unload(argv[2], 0);
+	}
+
+	if (strcmp(argv[1], "unload-force") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "error: unload-force requires a module name\n\n");
+			usage(argv[0]);
+		}
+		return cmd_unload(argv[2], 1);
 	}
 
 	fprintf(stderr, "error: unknown command '%s'\n\n", argv[1]);
