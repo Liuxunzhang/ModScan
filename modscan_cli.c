@@ -29,12 +29,13 @@ static void usage(const char *prog)
 		"  %s scan                    - scan for hidden kernel modules\n"
 		"  %s restore <name>          - restore hidden module by name\n"
 		"  %s restore-addr <hexaddr>  - restore hidden module by struct module address\n"
+		"  %s repair-force <name>     - aggressive in-kernel state/refcount repair\n"
 		"  %s unload <name>           - unload module via delete_module syscall\n"
 		"  %s unload-force <name>     - force unload module (O_TRUNC)\n"
 		"\n"
 		"The modscan kernel module must be loaded first:\n"
 		"  sudo insmod modscan.ko\n",
-		prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog);
 	exit(EXIT_FAILURE);
 }
 
@@ -167,10 +168,7 @@ static int cmd_restore_addr(const char *raw_addr)
 
 static int cmd_unload(const char *modname, int force)
 {
-	int flags = O_NONBLOCK;
-
-	if (force)
-		flags |= O_TRUNC;
+	int flags = force ? O_TRUNC : 0;
 
 #ifdef SYS_delete_module
 	if (syscall(SYS_delete_module, modname, flags) == 0) {
@@ -191,7 +189,7 @@ static int cmd_unload(const char *modname, int force)
 		break;
 	case EAGAIN:
 		fprintf(stderr,
-			"error: module '%s' temporarily unavailable, retry later.\n",
+			"error: module '%s' temporarily unavailable (state changing).\n",
 			modname);
 		break;
 	case ENOENT:
@@ -209,6 +207,44 @@ static int cmd_unload(const char *modname, int force)
 	}
 
 	return EXIT_FAILURE;
+}
+
+static int cmd_repair_force(const char *modname)
+{
+	char cmd[80];
+	ssize_t written;
+	int fd, len;
+
+	if (strlen(modname) > 55) {
+		fprintf(stderr, "error: module name too long (max 55 chars)\n");
+		return EXIT_FAILURE;
+	}
+
+	len = snprintf(cmd, sizeof(cmd), "repair-force %s", modname);
+	if (len < 0 || len >= (int)sizeof(cmd)) {
+		fprintf(stderr, "error: repair-force command too long\n");
+		return EXIT_FAILURE;
+	}
+
+	fd = open(PROC_PATH, O_WRONLY);
+	if (fd < 0) {
+		perror("open " PROC_PATH);
+		if (errno == ENOENT)
+			fprintf(stderr, "Is the modscan kernel module loaded?\n"
+					"  sudo insmod modscan.ko\n");
+		return EXIT_FAILURE;
+	}
+
+	written = write(fd, cmd, len);
+	close(fd);
+
+	if (written < 0) {
+		perror("write");
+		return EXIT_FAILURE;
+	}
+
+	printf("repair-force sent for module '%s'.\n", modname);
+	return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[])
@@ -241,6 +277,14 @@ int main(int argc, char *argv[])
 			usage(argv[0]);
 		}
 		return cmd_unload(argv[2], 0);
+	}
+
+	if (strcmp(argv[1], "repair-force") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "error: repair-force requires a module name\n\n");
+			usage(argv[0]);
+		}
+		return cmd_repair_force(argv[2]);
 	}
 
 	if (strcmp(argv[1], "unload-force") == 0) {

@@ -203,6 +203,97 @@ static bool name_in_modules_list(const char *name)
 	return false;
 }
 
+static struct module *find_module_in_modules_list_locked(const char *name)
+{
+	struct module *mod;
+
+	list_for_each_entry(mod, modules_list_head, list) {
+		if (strcmp(mod->name, name) == 0)
+			return mod;
+	}
+
+	return NULL;
+}
+
+static struct module *find_module_in_kset(const char *name)
+{
+	struct kobject *kobj;
+	struct module_kobject *mkobj;
+	struct module *target = NULL;
+
+	spin_lock(&modscan_kset->list_lock);
+	list_for_each_entry(kobj, &modscan_kset->list, entry) {
+		mkobj = container_of(kobj, struct module_kobject, kobj);
+		if (!mkobj->mod)
+			continue;
+		if (strcmp(mkobj->mod->name, name) == 0) {
+			target = mkobj->mod;
+			break;
+		}
+	}
+	spin_unlock(&modscan_kset->list_lock);
+
+	return target;
+}
+
+static int modscan_repair_force(const char *modname)
+{
+	struct module *target = NULL;
+	int refs_before = -1, refs_after = -1;
+
+	if (mutex_lock_killable(&module_mutex))
+		return -EINTR;
+
+	/* Prefer modules list (post restore-addr), fallback to kset */
+	target = find_module_in_modules_list_locked(modname);
+	if (!target)
+		target = find_module_in_kset(modname);
+
+	if (!target) {
+		mutex_unlock(&module_mutex);
+		pr_err("modscan: repair-force: module '%s' not found\n", modname);
+		return -ENOENT;
+	}
+
+	if (!name_in_modules_list(target->name))
+		list_add_tail(&target->list, modules_list_head);
+
+	if (target->state != MODULE_STATE_LIVE)
+		target->state = MODULE_STATE_LIVE;
+
+#ifdef CONFIG_MODULE_UNLOAD
+	refs_before = module_refcount(target);
+
+	/* Aggressive: try to drain refs using module_put() loops first. */
+	if (refs_before > 0) {
+		int i;
+
+		for (i = 0; i < 4096; i++) {
+			int cur = module_refcount(target);
+
+			if (cur <= 0)
+				break;
+			module_put(target);
+		}
+	}
+
+	refs_after = module_refcount(target);
+
+	/*
+	 * Keep this portable across old/new kernels:
+	 * struct module reference-count storage changed across versions,
+	 * so direct field writes (e.g. target->refcnt) are not stable.
+	 * We only drain refs via module_put() loops here.
+	 */
+#endif
+
+	mutex_unlock(&module_mutex);
+
+	pr_warn("modscan: repair-force '%s': state=LIVE refs(before=%d after=%d)\n",
+		modname, refs_before, refs_after);
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  vmap_area_list scan — Volatility 3 method, executed in kernel space */
 /* ------------------------------------------------------------------ */
@@ -994,10 +1085,14 @@ static ssize_t modscan_write(struct file *file, const char __user *ubuf,
 	}
 #endif
 
+	if (sscanf(kbuf, "repair-force %55s", modname) == 1)
+		return modscan_repair_force(modname) ? : count;
+
 	if (sscanf(kbuf, "restore %55s", modname) != 1) {
 		pr_err("modscan: unknown command '%s'\n"
 		       "modscan: usage:\n"
 		       "  echo 'restore <name>' > /proc/modscan\n"
+		       "  echo 'repair-force <name>' > /proc/modscan\n"
 		       "  echo 'restore-addr <hex>' > /proc/modscan\n",
 		       kbuf);
 		return -EINVAL;
